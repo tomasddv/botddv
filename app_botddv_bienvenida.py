@@ -6,7 +6,6 @@ import streamlit as st
 
 from assistant_engine import respond, statuses
 from auto_refresh import (
-    ensure_initial_ready,
     force_refresh_async,
     interval_minutes,
     start_background_updater,
@@ -49,22 +48,12 @@ if password:
             st.error("Clave incorrecta.")
         st.stop()
 
-missing_before = [s for s in statuses() if s.get("ok") is not True]
-if missing_before:
-    with st.spinner("Preparando automáticamente las fuentes que faltan..."):
-        initial_results = ensure_initial_ready()
-    failed_initial = {k: v for k, v in initial_results.items() if v != "OK"}
-    if failed_initial:
-        st.warning("Alguna fuente no pudo actualizarse todavía. El asistente seguirá usando las fuentes disponibles y volverá a intentarlo automáticamente.")
-else:
-    ensure_initial_ready()
-
 start_background_updater()
 
 st.markdown(f"""
 <div class="hero">
   <div class="eyebrow">ASISTENTE DDV · MODO RÁPIDO</div>
-  <h1>EDF + Repago + Frescura + Grupo de clientes</h1>
+  <h1>EDF + Repago + Frescura + Descuentos + Topes</h1>
   <p>Responde desde snapshots locales y mantiene las fuentes actualizadas automáticamente cada {interval_minutes()} minutos.</p>
 </div>
 <div class="fast-note"><b>⚡ Respuesta rápida:</b> una pregunta nunca espera Drive/GitHub ni recalcula Frescura. La actualización corre sola en segundo plano.</div>
@@ -102,7 +91,7 @@ with st.sidebar:
         "repago": "Repago mensual",
         "repago_count": "Conteo por repago",
         "monthly_sales": "Compra mensual",
-        "frescura": "Frescura",
+        "frescura": "Frescura", "stock": "Stock", "tope": "Topes Core/Value", "edf_location": "Ubicación EDF",
     }
     if topic:
         extra = ""
@@ -129,19 +118,20 @@ with st.sidebar:
                 st.info("Ya hay una actualización en curso.")
 
 source_status = statuses()
-cols = st.columns(3)
+cols = st.columns(len(source_status))
 for col, item in zip(cols, source_status):
     with col:
         state = item.get("ok")
-        if state is True:
+        if state is True and not item.get("warning"):
             css, label = "source-ok", "● LISTO"
-        elif state is None:
-            css, label = "source-idle", "● PREPARANDO"
+        elif state is None or item.get("warning"):
+            css, label = "source-idle", "● CON AVISO" if item.get("warning") else "● PREPARANDO"
         else:
             css, label = "source-bad", "● ERROR"
         st.markdown(
             f'<div class="source-card"><div class="{css}">{label}</div><b>{item.get("name")}</b><br>'
             f'<span class="small-muted">{item.get("detail","")}</span><br>'
+            f'<span class="small-muted">{item.get("warning", "")}</span><br>'
             f'<span class="small-muted">Snapshot: {item.get("loaded_at","—")}</span></div>',
             unsafe_allow_html=True,
         )
@@ -159,6 +149,7 @@ if ctx.get("active_topic"):
     label = {
         "discount":"Descuentos", "edf_count":"Cantidad EDF", "repago":"Repago mensual",
         "repago_count":"Conteo repago", "monthly_sales":"Compra mensual", "frescura":"Frescura",
+        "stock":"Stock", "tope":"Topes Core/Value", "edf_location":"Ubicación EDF",
     }.get(ctx.get("active_topic"), ctx.get("active_topic"))
     if ctx.get("active_topic") == "discount" and ctx.get("last_discount_segment"):
         label += f" · {ctx.get('last_discount_segment')}"
@@ -171,7 +162,7 @@ if "messages" not in st.session_state or not st.session_state.messages:
         "role":"assistant",
         "content":(
             "👋 **¡Hola! Bienvenido al Asistente Comercial DDV.**  \n\n"
-            "Podés consultarme por **EDF/heladeras, repago mensual, compra mensual, frescura y descuentos por segmento**. "
+            "Podés consultarme por **EDF/heladeras, repago mensual, compra mensual, frescura, descuentos y topes Core/Value**. "
             "También podés buscar clientes por **código, nombre de fantasía o razón social**.  \n\n"
             "Voy a mantener el **cliente y el tema de la conversación** para que puedas seguir preguntando sin repetir toda la información. "
             "¿Qué querés consultar?"

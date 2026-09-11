@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from .health import describe, stamp
+
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
-import ast
 import json
 import re
 import threading
@@ -25,12 +26,6 @@ GROUPS_URL = (
     "https://raw.githubusercontent.com/tomasddv/grupo-de-clientes-/main/"
     "trade_spend_dashboard/data/processed/group_summary.csv"
 )
-
-PLANIFICACION_TOPES_URL = (
-    "https://raw.githubusercontent.com/tomasddv/planificacion/main/"
-    "dashboard_bultos_accion.py"
-)
-DEFAULT_TOPES_CANAL = {"K+T": 200.0, "AUTOSERVICIO": 500.0, "AS": 500.0}
 
 _snapshot = None
 _last_error = None
@@ -80,56 +75,7 @@ def _download_csv(url: str) -> pd.DataFrame:
     return pd.read_csv(StringIO(response.text))
 
 
-def _download_text(url: str) -> str:
-    response = requests.get(
-        url,
-        timeout=25,
-        headers={"Cache-Control": "no-cache", "User-Agent": "DDV-fast-assistant/1.0"},
-    )
-    response.raise_for_status()
-    return response.text
-
-
-def _parse_topes_rules(source_text: str) -> dict[str, float]:
-    """Lee TOPES_CANAL directamente del dashboard de planificacion."""
-    rules = dict(DEFAULT_TOPES_CANAL)
-    try:
-        match = re.search(r"TOPES_CANAL\s*=\s*(\{.*?\})", source_text or "", flags=re.S)
-        if match:
-            parsed = ast.literal_eval(match.group(1))
-            for key, value in (parsed or {}).items():
-                rules[str(key).strip().upper()] = float(value)
-    except Exception:
-        pass
-    if "AUTOSERVICIO" in rules and "AS" not in rules:
-        rules["AS"] = rules["AUTOSERVICIO"]
-    return rules
-
-
-def _channel_from_groups(groups_text: object) -> str:
-    text = str(groups_text or "").upper()
-    if "K+T" in text or re.search(r"\bK\s*\+\s*T\b", text):
-        return "K+T"
-    if "AUTOSERVICIO" in text:
-        return "AS"
-    # Los nombres de grupo del ERP suelen verse como "SUR- CORE AS ..." o "SUR- VALUE AS ...".
-    if re.search(r"\b(?:CORE|VALUE)\s+AS\b", text) or re.search(r"\bAS\s*\(", text):
-        return "AS"
-    return ""
-
-
-def _tope_for_group(groups_text: object, rules: dict[str, float]) -> tuple[str, float | None]:
-    channel = _channel_from_groups(groups_text)
-    if not channel:
-        return "", None
-    if channel == "AS":
-        value = rules.get("AS", rules.get("AUTOSERVICIO"))
-    else:
-        value = rules.get(channel)
-    return channel, float(value) if value is not None else None
-
-
-def _build_snapshot(clients: pd.DataFrame, groups: pd.DataFrame, topes_rules: dict[str, float]) -> dict:
+def _build_snapshot(clients: pd.DataFrame, groups: pd.DataFrame) -> dict:
     if clients.empty:
         raise RuntimeError("client_percentages.csv está vacío")
 
@@ -155,14 +101,11 @@ def _build_snapshot(clients: pd.DataFrame, groups: pd.DataFrame, topes_rules: di
             porcentaje = 0.0
 
         grupos_text = str(row.get("grupos") or "").strip()
-        canal_tope, tope_bultos = _tope_for_group(grupos_text, topes_rules)
         item = {
             "segmento": segmento,
             "subsegmento": subsegmento,
             "porcentaje_total": porcentaje,
             "grupos": grupos_text,
-            "canal_tope": canal_tope,
-            "tope_bultos": tope_bultos,
             "fantasia": str(row.get("fantasia") or "").strip(),
             "promotor": str(row.get("promotor") or "").strip(),
             "ruta": str(row.get("ruta") or "").strip(),
@@ -204,10 +147,9 @@ def _build_snapshot(clients: pd.DataFrame, groups: pd.DataFrame, topes_rules: di
 
     return {
         "schema_version": 2,
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": stamp(),
         "data_date": latest,
-        "source": "Grupo de clientes + topes Planificacion · GitHub snapshot local",
-        "topes_rules": topes_rules,
+        "source": "Grupo de clientes · GitHub snapshot local",
         "customers": customers,
         "rows_by_customer": rows_by_customer,
         "groups": group_rows,
@@ -221,12 +163,7 @@ def refresh(force=True):
         try:
             clients = _download_csv(CLIENTS_URL)
             groups = _download_csv(GROUPS_URL)
-            try:
-                topes_source = _download_text(PLANIFICACION_TOPES_URL)
-                topes_rules = _parse_topes_rules(topes_source)
-            except Exception:
-                topes_rules = dict(DEFAULT_TOPES_CANAL)
-            snapshot = _build_snapshot(clients, groups, topes_rules)
+            snapshot = _build_snapshot(clients, groups)
             _last_error = None
             return _save(snapshot)
         except Exception as exc:
@@ -237,29 +174,10 @@ def refresh(force=True):
 
 def status():
     snap = _load_disk()
-    if snap and int(snap.get("schema_version") or 0) >= 2:
-        data_date = snap.get("data_date") or "—"
-        return {
-            "ok": True,
-            "name": "Grupo de clientes",
-            "detail": f"{len(snap.get('customers', {}))} clientes · descuentos + topes · datos {data_date}",
-            "loaded_at": snap.get("updated_at", "—"),
-        }
-    if snap:
-        return {
-            "ok": None,
-            "name": "Grupo de clientes",
-            "detail": "Actualizando snapshot para sumar topes Core/Value de Planificacion...",
-            "loaded_at": snap.get("updated_at", "—"),
-        }
-    if _last_error:
-        return {"ok": False, "name": "Grupo de clientes", "detail": str(_last_error), "loaded_at": "—"}
-    return {
-        "ok": None,
-        "name": "Grupo de clientes",
-        "detail": "Sin snapshot. Se actualizará automáticamente.",
-        "loaded_at": "—",
-    }
+    return describe('Grupo de clientes', snap, _last_error,
+                    compatible=int((snap or {}).get("schema_version") or 0) >= 2,
+                    detail='Descuentos Core/Value')
+
 
 def customer(customer_id: str):
     snap = _load_disk()
@@ -286,40 +204,6 @@ def discounts(customer_id: str, segment: str | None = None):
         return [r for r in rows if r.get("segmento") == "VALUE"]
     return [r for r in rows if r.get("segmento") == wanted]
 
-
-
-def topes(customer_id: str, segment: str | None = None):
-    """Devuelve topes CORE/VALUE del cliente según el canal definido en Planificacion."""
-    snap = _load_disk()
-    if not snap:
-        return []
-    rows = list(snap.get("rows_by_customer", {}).get(_norm_code(customer_id), []))
-    wanted = str(segment or "").strip().upper()
-    if wanted in {"CORE", "VALUE"}:
-        rows = [r for r in rows if str(r.get("segmento") or "").upper() == wanted]
-    else:
-        rows = [r for r in rows if str(r.get("segmento") or "").upper() in {"CORE", "VALUE"}]
-
-    out = []
-    seen = set()
-    for r in rows:
-        seg = str(r.get("segmento") or "").upper()
-        channel = str(r.get("canal_tope") or "")
-        value = r.get("tope_bultos")
-        if value is None:
-            continue
-        key = (seg, channel, float(value))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({
-            "segmento": seg,
-            "canal": channel,
-            "tope_bultos": float(value),
-            "grupos": r.get("grupos") or "",
-        })
-    out.sort(key=lambda r: (r.get("segmento") or "", r.get("canal") or ""))
-    return out
 
 
 def search_customers(text: str, limit: int = 8):

@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+.runtime_modules/
+data/*-runtime*/
+.streamlit/secrets.toml

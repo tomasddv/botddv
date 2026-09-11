@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .health import describe, stamp
+
 from datetime import datetime
 from pathlib import Path
 import json
@@ -263,7 +265,7 @@ def _snapshot_from_db(db: dict) -> dict:
 
     return {
         "schema_version": 3,
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": stamp(),
         "available_periods": available_periods,
         "repago_periods": repago_periods,
         "latest_period": latest_period,
@@ -292,7 +294,11 @@ def refresh(force=True):
     """Actualización pesada explícita. Las consultas nunca llaman a esta función."""
     global _last_error
     with _lock:
-        module = _prepare_module()
+        try:
+            module = _prepare_module()
+        except Exception as exc:
+            _last_error = exc
+            raise
         last_exc = None
         for attempt in range(2):
             try:
@@ -313,27 +319,10 @@ def refresh(force=True):
 
 def status():
     snap = _load_disk()
-    if snap and int(snap.get("schema_version") or 0) >= 3:
-        return {
-            "ok": True,
-            "name": "Repagos EDF",
-            "detail": (
-                f"{len(snap.get('customers', {}))} clientes · trim. "
-                f"{', '.join(snap.get('repago_periods') or []) or '—'} · último mes "
-                f"{snap.get('latest_period') or '—'}"
-            ),
-            "loaded_at": snap.get("updated_at", "—"),
-        }
-    if snap:
-        return {
-            "ok": None,
-            "name": "Repagos EDF",
-            "detail": "Actualizando snapshot al cálculo de trimestre + último mes...",
-            "loaded_at": snap.get("updated_at", "—"),
-        }
-    if _last_error:
-        return {"ok": False, "name": "Repagos EDF", "detail": str(_last_error), "loaded_at": "—"}
-    return {"ok": None, "name": "Repagos EDF", "detail": "Sin snapshot. Se actualizará automáticamente.", "loaded_at": "—"}
+    return describe('Repagos EDF', snap, _last_error,
+                    compatible=int((snap or {}).get("schema_version") or 0) >= 3,
+                    detail='EDF y repago trimestral/último mes')
+
 
 def customer(customer_id: str):
     snap = _load_disk()

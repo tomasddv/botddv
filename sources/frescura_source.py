@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .health import describe, stamp
+
 from datetime import datetime, date
 from pathlib import Path
 import json
@@ -222,7 +224,7 @@ def _build_snapshot(trelew_path: Path, madryn_path: Path, customer_path: Path,
         }
 
     return {
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": stamp(),
         "as_of": as_of.isoformat(),
         "source": "Frescura Predictiva v9 · snapshot local",
         "products": product_map,
@@ -269,16 +271,9 @@ def refresh(force=True):
 
 def status():
     snap = _load_disk()
-    if snap:
-        return {
-            "ok": True,
-            "name": "Frescura",
-            "detail": f"{len(snap.get('products', {}))} SKU · cálculo al {snap.get('as_of','—')} · consulta local instantánea",
-            "loaded_at": snap.get("updated_at", "—"),
-        }
-    if _last_error:
-        return {"ok": False, "name": "Frescura", "detail": str(_last_error), "loaded_at": "—"}
-    return {"ok": None, "name": "Frescura", "detail": "Sin snapshot. Se actualizará automáticamente.", "loaded_at": "—"}
+    return describe('Frescura', snap, _last_error,
+                    compatible=int((snap or {}).get("schema_version") or 0) >= 0,
+                    detail='Stock y Frescura · consulta local')
 
 
 def product(code: str):

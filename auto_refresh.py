@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from datetime import datetime
 from typing import Any
 
-from sources import repago_source, frescura_source, grupos_source
+from sources import repago_source, frescura_source, grupos_source, planificacion_source
 
 _INTERVAL_MINUTES = max(5, int(os.getenv("AUTO_REFRESH_MINUTES", "30") or 30))
 _INTERVAL_SECONDS = _INTERVAL_MINUTES * 60
@@ -27,6 +28,7 @@ _SOURCES = (
     ("Repagos / EDF", repago_source),
     ("Frescura", frescura_source),
     ("Grupo de clientes", grupos_source),
+    ("Topes Planificación", planificacion_source),
 )
 
 
@@ -47,12 +49,17 @@ def _cycle() -> dict[str, str]:
 
     results: dict[str, str] = {}
     try:
-        for label, module in _SOURCES:
-            try:
-                module.refresh(force=True)
-                results[label] = "OK"
-            except Exception as exc:
-                results[label] = f"{type(exc).__name__}: {exc}"
+        with ThreadPoolExecutor(max_workers=len(_SOURCES)) as pool:
+            pending = {pool.submit(module.refresh, force=True): label for label, module in _SOURCES}
+            for future in as_completed(pending):
+                label = pending[future]
+                try:
+                    future.result()
+                    results[label] = "OK"
+                except Exception as exc:
+                    results[label] = f"{type(exc).__name__}: {exc}"
+                with _lock:
+                    _state["results"] = dict(results)
     finally:
         with _lock:
             _state["running"] = False
@@ -63,28 +70,9 @@ def _cycle() -> dict[str, str]:
 
 
 def ensure_initial_ready() -> dict[str, str]:
-    """Carga automáticamente cualquier fuente que aún no tenga snapshot.
-
-    Los snapshots empaquetados permiten responder al instante. Si una fuente falta,
-    sólo esa fuente se actualiza de forma automática antes de habilitar su consulta.
-    """
-    global _initial_attempted
-    with _lock:
-        if _initial_attempted:
-            return {}
-        _initial_attempted = True
-
-    results: dict[str, str] = {}
-    for label, module in _SOURCES:
-        try:
-            status = module.status()
-            if status.get("ok") is True:
-                continue
-            module.refresh(force=True)
-            results[label] = "OK"
-        except Exception as exc:
-            results[label] = f"{type(exc).__name__}: {exc}"
-    return results
+    """Start background refresh without delaying the first chat render."""
+    start_background_updater()
+    return {}
 
 
 def _worker() -> None:
