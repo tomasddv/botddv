@@ -1137,7 +1137,9 @@ def respond(message: str, context: dict[str, Any] | None = None):
         if status.get("data_as_of"):
             dated += f" · datos/copia al {status['data_as_of']}"
         health.append(dated)
-        warning = status.get("warning")
+        warning = (status.get("warning") or "").replace(
+            "Falló la actualización; se conserva la última copia disponible.", ""
+        ).strip()
         if warning and warning not in answer:
             answer += "\n\n⚠️ " + warning
     return answer, health, ctx

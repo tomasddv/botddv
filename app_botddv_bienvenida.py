@@ -122,16 +122,15 @@ cols = st.columns(len(source_status))
 for col, item in zip(cols, source_status):
     with col:
         state = item.get("ok")
-        if state is True and not item.get("warning"):
-            css, label = "source-ok", "● LISTO"
-        elif state is None or item.get("warning"):
-            css, label = "source-idle", "● CON AVISO" if item.get("warning") else "● PREPARANDO"
+        if state is True:
+            css, label = "source-ok", "● DATOS DISPONIBLES"
+        elif state is None:
+            css, label = "source-idle", "● PREPARANDO"
         else:
-            css, label = "source-bad", "● ERROR"
+            css, label = "source-idle", "● SIN DATOS DISPONIBLES"
         st.markdown(
             f'<div class="source-card"><div class="{css}">{label}</div><b>{item.get("name")}</b><br>'
             f'<span class="small-muted">{item.get("detail","")}</span><br>'
-            f'<span class="small-muted">{item.get("warning", "")}</span><br>'
             f'<span class="small-muted">Snapshot: {item.get("loaded_at","—")}</span></div>',
             unsafe_allow_html=True,
         )

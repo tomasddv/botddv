@@ -1,4 +1,4 @@
-# Deployment refresh: 2026-09-11 topes with purchased bultos and remaining balance.
+# Deployment refresh: simplify chat UI and keep refresh errors internal.
 streamlit>=1.58
 pandas>=2.2
 numpy>=2.0
