@@ -126,19 +126,64 @@ def _norm_serial(value) -> str:
     return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
 
 
+
+def _sequential_repayment_rows(raw_by_group: dict, customer_db: dict, periods: list[str], average: bool, mode: str) -> dict:
+    """Replica period_repayment_map del dashboard original para un período dado."""
+    rows_by_customer: dict[str, list[dict]] = {}
+    for (cid, business), group in raw_by_group.items():
+        group = sorted(group, key=lambda r: (r.get("asset") or "", r.get("serial") or ""))
+        customer = customer_db.get(cid) or {}
+        if periods:
+            available = sum(_monthly_hl(customer, business, p) for p in periods)
+            if average:
+                available = available / len(periods)
+        else:
+            available = 0.0
+        remaining = float(available or 0)
+
+        for raw in group:
+            target = float(raw.get("target") or 0)
+            if str(raw.get("status") or "").upper() == "PDV" and target > 0:
+                assigned = min(target, max(remaining, 0))
+                remaining -= assigned
+                pct_value = round((assigned / target) * 100) if target else 0
+            else:
+                assigned = 0.0
+                pct_value = 0
+
+            rows_by_customer.setdefault(cid, []).append({
+                "asset": raw.get("asset") or "—",
+                "serial": raw.get("serial") or "",
+                "model": raw.get("model") or "—",
+                "business": business,
+                "status": raw.get("status") or "",
+                "deposit": raw.get("deposit") or "",
+                "hl": round(assigned, 4),
+                "business_period_hl": round(float(available or 0), 4),
+                "repago_periods": list(periods),
+                "repago_mode": mode,
+                "target": target,
+                "pct": pct_value,
+                "band": _band(pct_value, assigned),
+            })
+    return rows_by_customer
+
+
+
 def _snapshot_from_db(db: dict) -> dict:
     """Snapshot alineado con el dashboard original de Repago.
 
-    Repago predeterminado = promedio mensual de los últimos 3 períodos disponibles,
-    repartido de forma SECUENCIAL entre EDF del mismo cliente + negocio, ordenados
-    por activo/serie. Esto replica period_repayment_map(..., average=True) del repo
-    tomasddv/repagos.
+    Se guardan dos vistas ya calculadas y rápidas:
+    - trimestre: promedio mensual de los últimos 3 períodos, asignación secuencial;
+    - ultimo_mes: último período disponible, asignación secuencial.
     """
+    available_periods = _available_periods(db)
     monthly_period = _latest_complete_period(db)
-    repago_periods = _repago_periods(db)
+    repago_periods = available_periods[-3:]
+    latest_period = available_periods[-1] if available_periods else ""
 
-    customer_db = {}
-    customers = {}
+    customer_db: dict[str, dict] = {}
+    customers: dict[str, dict] = {}
     for c in db.get("customers", []):
         cid = _norm_code(c.get("id"))
         if not cid:
@@ -147,12 +192,15 @@ def _snapshot_from_db(db: dict) -> dict:
 
         monthly_by_business = {}
         monthly_total = 0.0
-        repago_avg_by_business = {}
+        latest_by_business = {}
+        latest_total = 0.0
         for business in ("CZA", "UNG", "AGUAS", "RB", "OTROS"):
             month_value = _monthly_hl(c, business, monthly_period) if monthly_period else 0.0
+            latest_value = _monthly_hl(c, business, latest_period) if latest_period else 0.0
             monthly_by_business[business] = round(month_value, 4)
+            latest_by_business[business] = round(latest_value, 4)
             monthly_total += month_value
-            repago_avg_by_business[business] = _average_hl(c, business, repago_periods)
+            latest_total += latest_value
 
         customers[cid] = {
             "id": cid,
@@ -165,13 +213,14 @@ def _snapshot_from_db(db: dict) -> dict:
             "monthly_period": monthly_period,
             "monthly_hl": round(monthly_total, 4),
             "monthly_by_business": monthly_by_business,
+            "latest_period": latest_period,
+            "latest_hl": round(latest_total, 4),
+            "latest_by_business": latest_by_business,
             "repago_periods": repago_periods,
-            "repago_avg_by_business": repago_avg_by_business,
         }
 
-    # Todos los EDF para poder consultar una serie aunque no esté colocada en un cliente.
-    all_edfs = []
-    raw_by_group = {}
+    all_edfs: list[dict] = []
+    raw_by_group: dict[tuple[str, str], list[dict]] = {}
     for edf in db.get("edfs", []):
         cid = _norm_code(edf.get("customerId"))
         customer = customers.get(cid) or {}
@@ -194,58 +243,35 @@ def _snapshot_from_db(db: dict) -> dict:
             "legal_name": customer.get("legal_name") or "",
             "address": customer.get("address") or "",
             "city": customer.get("city") or "",
+            "target": target,
         }
         all_edfs.append(location_row)
 
-        if not cid:
-            continue
-        row = {
-            **location_row,
-            "cid": cid,
-            "target": target,
-        }
-        raw_by_group.setdefault((cid, business), []).append(row)
-
-    # Repago secuencial, igual al commit actual del repo original.
-    rows_by_customer = {}
-    for (cid, business), group in raw_by_group.items():
-        group.sort(key=lambda r: (r.get("asset") or "", r.get("serial") or ""))
-        available_avg = float((customers.get(cid, {}).get("repago_avg_by_business") or {}).get(business) or 0)
-        remaining = available_avg
-
-        for raw in group:
-            target = float(raw.get("target") or 0)
-            if raw.get("status") == "PDV" and target > 0:
-                assigned = min(target, max(remaining, 0))
-                remaining -= assigned
-                pct_value = round((assigned / target) * 100) if target else 0
-            else:
-                assigned = 0.0
-                pct_value = 0
-
-            rows_by_customer.setdefault(cid, []).append({
-                "asset": raw["asset"],
-                "serial": raw.get("serial") or "",
-                "model": raw["model"],
-                "business": business,
-                "status": raw.get("status"),
-                "deposit": raw.get("deposit") or "",
-                "hl": round(assigned, 4),
-                "business_avg_hl": round(available_avg, 4),
-                "repago_periods": repago_periods,
+        if cid:
+            raw_by_group.setdefault((cid, business), []).append({
+                **location_row,
+                "cid": cid,
                 "target": target,
-                "pct": pct_value,
-                "band": _band(pct_value, assigned),
             })
 
+    rows_trim = _sequential_repayment_rows(
+        raw_by_group, customer_db, repago_periods, average=True, mode="trimestre"
+    )
+    rows_last = _sequential_repayment_rows(
+        raw_by_group, customer_db, [latest_period] if latest_period else [], average=False, mode="ultimo_mes"
+    )
+
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "available_periods": available_periods,
         "repago_periods": repago_periods,
+        "latest_period": latest_period,
         "monthly_period": monthly_period,
-        "source": "Repagos EDF · trimestre promedio · secuencial · snapshot local",
+        "source": "Repagos EDF · trimestre/último mes · secuencial · snapshot local",
         "customers": customers,
-        "rows_by_customer": rows_by_customer,
+        "rows_by_customer": rows_trim,
+        "rows_by_customer_latest": rows_last,
         "all_edfs": all_edfs,
     }
 
@@ -284,26 +310,30 @@ def refresh(force=True):
         raise last_exc
 
 
+
 def status():
     snap = _load_disk()
-    if snap and int(snap.get("schema_version") or 0) >= 2:
+    if snap and int(snap.get("schema_version") or 0) >= 3:
         return {
             "ok": True,
             "name": "Repagos EDF",
-            "detail": f"{len(snap.get('customers', {}))} clientes · repago trim. promedio {', '.join(snap.get('repago_periods') or []) or '—'}",
+            "detail": (
+                f"{len(snap.get('customers', {}))} clientes · trim. "
+                f"{', '.join(snap.get('repago_periods') or []) or '—'} · último mes "
+                f"{snap.get('latest_period') or '—'}"
+            ),
             "loaded_at": snap.get("updated_at", "—"),
         }
     if snap:
         return {
             "ok": None,
             "name": "Repagos EDF",
-            "detail": "Actualizando snapshot al cálculo secuencial de trimestre promedio...",
+            "detail": "Actualizando snapshot al cálculo de trimestre + último mes...",
             "loaded_at": snap.get("updated_at", "—"),
         }
     if _last_error:
         return {"ok": False, "name": "Repagos EDF", "detail": str(_last_error), "loaded_at": "—"}
     return {"ok": None, "name": "Repagos EDF", "detail": "Sin snapshot. Se actualizará automáticamente.", "loaded_at": "—"}
-
 
 def customer(customer_id: str):
     snap = _load_disk()
@@ -312,12 +342,16 @@ def customer(customer_id: str):
     return snap.get("customers", {}).get(_norm_code(customer_id))
 
 
-def customer_repayments(customer_id: str):
+
+def customer_repayments(customer_id: str, mode: str = "trimestre"):
     snap = _load_disk()
     if not snap:
         return []
-    return list(snap.get("rows_by_customer", {}).get(_norm_code(customer_id), []))
-
+    cid = _norm_code(customer_id)
+    wanted = str(mode or "trimestre").strip().lower()
+    if wanted in {"ultimo_mes", "último_mes", "mes", "mes_corriente", "ultimo", "latest"}:
+        return list(snap.get("rows_by_customer_latest", {}).get(cid, []))
+    return list(snap.get("rows_by_customer", {}).get(cid, []))
 
 def _norm_text(value) -> str:
     import unicodedata
@@ -382,24 +416,34 @@ def edf_by_serial(serial: str):
     return None
 
 
-def search_edf_serial(serial: str, limit: int = 8):
+
+def search_edf_serial(serial: str, limit: int = 12):
+    """Busca coincidencias parciales de serie y las ordena por cercanía."""
     snap = _load_disk()
     if not snap:
         return []
     key = _norm_serial(serial)
     if not key:
         return []
-    out = []
+
+    scored = []
     for row in snap.get("all_edfs", []):
         serial_key = _norm_serial(row.get("serial"))
-        if key in serial_key:
-            out.append(dict(row))
-            if len(out) >= limit:
-                break
-    return out
+        if not serial_key or key not in serial_key:
+            continue
+        if serial_key == key:
+            score = 1000
+        elif serial_key.endswith(key):
+            score = 900
+        elif serial_key.startswith(key):
+            score = 850
+        else:
+            score = 700
+        score -= abs(len(serial_key) - len(key))
+        scored.append((score, serial_key, dict(row)))
 
-
-_load_disk()
+    scored.sort(key=lambda x: (-x[0], len(x[1]), x[1]))
+    return [row for _, _, row in scored[:limit]]
 
 def customer_edfs(customer_id: str):
     """Todos los EDF/heladeras asignados al cliente, sin forzar una lectura de repago."""
