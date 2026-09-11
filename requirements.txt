@@ -1,4 +1,4 @@
-# Deployment refresh: load all modules for release 62a1b47 (topes Planificacion).
+# Deployment refresh: 2026-09-11 topes with purchased bultos and remaining balance.
 streamlit>=1.58
 pandas>=2.2
 numpy>=2.0

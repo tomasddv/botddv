@@ -15,6 +15,7 @@ import pandas as pd
 import requests
 from . import frescura_source
 from .health import describe, stamp
+from . import planificacion_sales
 
 ROOT = Path(__file__).resolve().parent.parent
 SNAPSHOT_PATH = ROOT / "data/cache/topes_snapshot.json"
@@ -159,8 +160,20 @@ def refresh(force=True):
                 extensions = download_extensions(os.getenv("PLANIFICACION_EXTENSIONS_SHEET_URL") or rules["DEFAULT_SHEET_URL"], rules["EXTENSION_SHEET_NAME"])
             except Exception as exc:
                 extension_error = f"{type(exc).__name__}: {exc}"
-            snapshot = {"schema_version": 1, "updated_at": stamp(), "customers": customers,
+            sales, sales_error = None, None
+            try:
+                sales_item = frescura_source._pick(items, ("venta", "bulto"), (".txt", ".csv"))
+                aux_item = frescura_source._pick(items, ("auxiliares",), (".xlsx",))
+                if not sales_item or not aux_item:
+                    raise ValueError("Faltan ventas en bultos o AUXILIARES de Planificación.")
+                sales_path = frescura_source._download(sales_item, ROOT / "data/topes-runtime")
+                aux_path = frescura_source._download(aux_item, ROOT / "data/topes-runtime")
+                sales = planificacion_sales.load_daily(sales_path, aux_path)
+            except Exception as exc:
+                sales_error = f"{type(exc).__name__}: {exc}"
+            snapshot = {"schema_version": 2, "updated_at": stamp(), "customers": customers,
                         "rules": rules["TOPES_CANAL"], "extensions": extensions,
+                        "sales": sales, "sales_error": sales_error,
                         "extensions_error": extension_error, "master_file": path.name,
                         "rules_url": RULES_URL}
             SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -179,6 +192,8 @@ def status():
     result = describe("Topes Planificación", snap, _last_error, detail="Topes Core/Value desde maestro y ampliaciones de Planificación")
     if snap and snap.get("extensions_error"):
         result["warning"] = (result["warning"] + " No se pudieron verificar las ampliaciones; sólo se informa el tope base.").strip()
+    if snap and not snap.get("sales"):
+        result["warning"] = (result["warning"] + " Ventas en bultos sin verificar; no se informa comprado ni saldo.").strip()
     return result
 
 
@@ -207,5 +222,6 @@ def topes(cid, segment=None):
         second = base if extension.get("active") else 0
         rows.append({"segmento": action, "canal": c["canal"], "base": base,
                      "second": second, "total": base + second, "date": extension.get("date"),
+                     "purchases": planificacion_sales.purchases(snap.get("sales"), c['id'], action, base, extension),
                      "extensions_verified": not bool(snap.get("extensions_error"))})
     return rows

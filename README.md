@@ -38,9 +38,13 @@ Se muestran por separado disponibilidad, fecha de copia/datos y fallos de actual
 
 Core y Value son independientes. Con ampliación activa y fecha válida, Planificación habilita un segundo tramo igual al tope base. La última fila de cada cliente/acción prevalece, incluso para desactivar una ampliación. No se reinterpretan los campos primer/segundo_tope de la hoja: el dashboard calcula el segundo tramo desde el tope del canal.
 
-La respuesta detalla base, segundo tramo y fecha. El total autorizado **no es el saldo disponible**: el consumo por tramo requiere consultar ventas y fechas de compra, y no se calcula en esta integración.
+La respuesta detalla base, segundo tramo, fecha, compras y saldo. Lee `ventadiaria bultos.txt` y `AUXILIARES.xlsx` de la misma carpeta. Usa exclusivamente `Cantidades Totales`, con signo para devoluciones, clasificación de CZA y las excepciones de marcas Core/Value del dashboard. Los parsers locales proceden de Planificación `ce5200e`.
 
-Si falla la hoja de ampliaciones se informa sólo el tope base y se indica que las ampliaciones no se pudieron verificar. Si no hay reglas o canal verificable, no se inventa un límite a partir del grupo de descuentos.
+Por defecto se muestra el acumulado del mes calendario actual hasta hoy (zona Argentina), con el último día de ventas disponible. No se cuentan fechas futuras ni se confunde fecha de descarga con fecha de ventas. Si el archivo no tiene datos del mes actual, se indica información no disponible, no cero.
+
+Sin ampliación, el saldo es tope base menos compras netas. Con ampliación se muestra además comprado desde la fecha de ampliación (inclusive) y saldo del segundo tramo, igual que Planificación; no se mezclan los dos tramos. Los excedentes se muestran expresamente.
+
+Si falla la hoja de ampliaciones se informa sólo el tope y saldo base, indicando que las ampliaciones no se pudieron verificar. Si fallan ventas o auxiliares no se informa comprado ni saldo. Si no hay reglas o canal verificable, no se inventa un límite a partir del grupo de descuentos.
 
 La paridad se contrastó con Planificación `ce5200e562a371d320669e094c88a653c1669655`: 2.126 clientes y 3.668 combinaciones cliente/segmento sin discrepancias, usando los mismos archivos fuente. Revisar la integración cuando cambien clasificación o reglas del dashboard.
 

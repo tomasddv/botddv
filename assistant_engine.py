@@ -72,6 +72,7 @@ def scope_label(scope):
 
 
 STOPWORDS = {
+    "lleva", "llevan", "llevamos", "comprado", "comprados", "compro", "compraron", "comprando", "dia", "hoy", "fecha", "saldo", "restante", "restantes", "disponible", "disponibles", "consumido", "consumidos", "acumulado", "acumulados",
     "repago", "repaga", "repagan", "repagando", "cliente", "clientes", "del", "de", "la", "el", "los", "las",
     "como", "esta", "estado", "cuantas", "cuantos", "cuanta", "cuanto", "cantidad", "tiene", "tienen", "hay",
     "heladera", "heladeras", "edf", "equipo", "equipos", "que", "cual", "cuales", "descuento", "descuentos",
@@ -637,7 +638,27 @@ def _tope_answer(raw, ctx, requested_segment=None):
             lines.append(f"- **{label}: {number(row['total'], 0)} bultos autorizados**: primer tramo {number(row['base'], 0)} + segundo tramo {number(row['second'], 0)}, habilitado el {date_arg(row['date'])}.")
         else:
             lines.append(f"- **{label}: {number(row['base'], 0)} bultos**. Sin segundo tramo activo.")
-    lines += ["", "Estos son topes autorizados; no representan el saldo pendiente de compra."]
+        purchases = row.get("purchases")
+        if purchases:
+            lines.append(f"  Comprados: **{number(purchases['bought'], 2)} bultos netos**.")
+            remaining = purchases['base_remaining']
+            if row['second'] and row['extensions_verified']:
+                lines.append(f"  Comprados desde la ampliación: **{number(purchases['second_bought'], 2)} bultos**.")
+                remaining = purchases['second_remaining']
+                balance_label = 'del segundo tramo'
+            else:
+                balance_label = 'del tope base' if not row['extensions_verified'] else 'del tope'
+            if remaining >= 0:
+                lines.append(f"  Restan {balance_label}: **{number(remaining, 2)} bultos**.")
+            else:
+                lines.append(f"  Excedido {balance_label} en **{number(-remaining, 2)} bultos**.")
+        else:
+            lines.append("  Comprados y saldo: **sin datos verificados para el mes actual**.")
+    period = next((r['purchases'] for r in rows if r.get('purchases')), None)
+    if period:
+        lines += ["", f"Ventas del **{date_arg(period['period_start'])} al {date_arg(period['cutoff'])}**, último día cargado hasta hoy. Incluye devoluciones/notas de crédito con su signo."]
+        if period['future_excluded']:
+            lines.append("Se excluyeron registros con fecha posterior a hoy.")
     return "\n".join(lines), ["Planificación · topes Core/Value"]
 
 
@@ -855,6 +876,17 @@ def _respond(message: str, context: dict[str, Any] | None = None):
         and any(k in text for k in ("mes", "mensual", "compra", "vende", "hl", "hectolit"))
         and not repago_words
     )
+
+    purchase_followup = any(k in text for k in ("compr", "lleva", "saldo", "resta", "queda", "consum", "acumul"))
+    if not repago_words and not any(k in text for k in ("hectolit", " hl")) and purchase_followup and (
+        "tope" in text or "bulto" in text or "core" in text or "value" in text or ctx.get("active_topic") == "tope"
+    ):
+        segment = _tope_segment(text)
+        if segment is None and not ("core" in text and "value" in text):
+            segment = ctx.get("last_tope_segment") if ctx.get("active_topic") == "tope" else None
+        answer, sources = _tope_answer(raw, ctx, segment)
+        ctx.update(active_topic="tope", last_tope_segment=segment, last_intent="tope")
+        return answer, sources, ctx
 
     # 0) Respuesta a la repregunta de localidad para stock.
     scope_only = bool(explicit_scope) and not entity_query(raw) and not any(k in text for k in ("frescura", "riesgo", "venc", "lote", "repago", "tope", "descuento", "stock", "compra", "venta"))
