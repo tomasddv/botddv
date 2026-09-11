@@ -56,15 +56,16 @@ def extract_code(text):
     return None
 
 
+
 def scope_from(text):
-    if "trelew" in text:
+    clean = normalize(text)
+    if "trelew" in clean:
         return "TRELEW"
-    if "madryn" in text or "puerto madryn" in text:
+    if "madryn" in clean or "puerto madryn" in clean:
         return "MADRYN"
-    if "total ddv" in text or "ddv" in text:
+    if "total ddv" in clean or clean == "total" or " ddv" in f" {clean}":
         return "DDV"
     return None
-
 
 def scope_label(scope):
     return "TOTAL DDV" if scope == "DDV" else str(scope or "DDV").title()
@@ -80,6 +81,7 @@ STOPWORDS = {
     "mas", "menos", "mayor", "menor", "supera", "superan", "superior", "inferior", "arriba", "debajo",
     "al", "desde", "hasta", "ese", "esa", "esos", "esas", "mismo", "misma", "anterior", "anteriores",
     "serie", "serial", "numero", "nro", "ubicado", "ubicada", "ubicacion", "donde", "colocado", "colocada",
+    "tope", "topes", "bulto", "bultos", "puede", "pueden", "comprar", "ultimo", "ultima", "corriente", "actual", "trimestre", "promedio",
     "este", "esta", "estos", "estas", "sobre", "son", "con", "sin", "lo", "le", "les", "quedan", "queda",
 }
 
@@ -110,6 +112,10 @@ def _copy_context(context: dict[str, Any] | None) -> dict[str, Any]:
         "last_discount_segment": None,
         "last_repago_op": None,
         "last_repago_threshold": None,
+        "last_repago_mode": "trimestre",
+        "last_tope_segment": None,
+        "pending_stock_scope": False,
+        "pending_stock_sku": None,
     }
     if context:
         base.update(context)
@@ -251,29 +257,51 @@ def _monthly_sales_answer(raw, ctx):
     ), ["Ventas mensuales EDF · snapshot local"]
 
 
-def _repago_answer(raw, ctx):
+
+def _repago_mode_from_text(raw: str, default: str = "trimestre") -> str:
+    text = normalize(raw)
+    if any(k in text for k in (
+        "ultimo mes", "mes corriente", "mes actual", "este mes", "solo mes", "un mes"
+    )):
+        return "ultimo_mes"
+    if any(k in text for k in ("trimestre", "promedio mensual", "promedio de")):
+        return "trimestre"
+    return default if default in {"trimestre", "ultimo_mes"} else "trimestre"
+
+
+
+def _repago_answer(raw, ctx, forced_mode=None):
     cust, err = _resolve_repago_customer(raw, ctx)
     if err:
         return err, ["Repagos EDF · snapshot local"]
     _set_client_context(ctx, cust)
     code = cust["id"]
-    rows = repago_source.customer_repayments(code)
     name = cust.get("name") or cust.get("legal_name") or ""
+
+    default_mode = forced_mode or ctx.get("last_repago_mode") or "trimestre"
+    mode = _repago_mode_from_text(raw, default_mode)
+    rows = repago_source.customer_repayments(code, mode=mode)
     if not rows:
         return f"**Cliente {code} — {name}** no tiene EDF con repago calculado.", ["Repagos EDF · snapshot local"]
 
-    periods = rows[0].get("repago_periods") or cust.get("repago_periods") or []
+    periods = rows[0].get("repago_periods") or []
     placed = [r for r in rows if str(r.get("status") or "").upper() == "PDV"]
-    lines = [
-        f"**Cliente {code} — {name}**",
-        f"Repago · promedio mensual de **{_periods_label(periods)}**:",
-        "",
-    ]
+
+    if mode == "ultimo_mes":
+        period_text = _period_label(periods[-1] if periods else cust.get("latest_period"))
+        lines = [f"**Cliente {code} — {name}**", f"Repago de **{period_text}**:", ""]
+        source = "Repagos EDF · último mes · secuencial"
+    else:
+        lines = [
+            f"**Cliente {code} — {name}**",
+            f"Repago · promedio mensual de **{_periods_label(periods)}**:",
+            "",
+        ]
+        source = "Repagos EDF · trimestre promedio · secuencial"
+
     for r in placed:
         serial = f" · serie {r.get('serial')}" if r.get("serial") else ""
-        lines.append(
-            f"- **{r.get('asset','—')}** · {r.get('model','—')}{serial}: **{pct(r.get('pct'))}**"
-        )
+        lines.append(f"- **{r.get('asset','—')}** · {r.get('model','—')}{serial}: **{pct(r.get('pct'))}**")
 
     if not placed:
         lines.append("No tiene EDF colocados en PDV.")
@@ -281,7 +309,8 @@ def _repago_answer(raw, ctx):
         over_75 = sum(1 for r in placed if float(r.get("pct") or 0) >= 75)
         lines += ["", f"**{over_75} de {len(placed)}** están en **75% o más**."]
 
-    return "\n".join(lines), ["Repagos EDF · trimestre promedio · secuencial"]
+    ctx["last_repago_mode"] = mode
+    return "\n".join(lines), [source]
 
 def _edf_count_answer(raw, ctx):
     cust, err = _resolve_repago_customer(raw, ctx)
@@ -305,38 +334,56 @@ def _edf_count_answer(raw, ctx):
 
 
 
-def _serial_from_query(raw: str) -> str:
-    """Extrae el valor que acompaña a 'serie/serial'. Admite letras, números y guiones."""
-    original = str(raw or "").strip()
-    match = re.search(
-        r"(?:n[uú]mero\s+de\s+serie|nro\.?\s*serie|nro\.?\s*de\s*serie|serie|serial)\s*(?:nro\.?|n[uú]mero)?\s*[:#-]?\s*([A-Za-z0-9][A-Za-z0-9._/-]*)",
-        original,
-        flags=re.I,
-    )
-    if match:
-        return match.group(1).strip(" .,:;?")
-    return ""
 
+
+def _serial_from_query(raw: str) -> str:
+    """Extrae serie completa o parcial. También acepta 'EDF 565964'."""
+    original = str(raw or "").strip()
+
+    patterns = [
+        r"(?:n[uú]mero\s+de\s+serie|nro\.?\s*serie|nro\.?\s*de\s*serie|serie|serial)\s*(?:nro\.?|n[uú]mero)?\s*[:#-]?\s*([A-Za-z0-9][A-Za-z0-9._/-]{2,})",
+        r"(?:edf|equipo|heladera)\s*(?:nro\.?|n[uú]mero)?\s*[:#-]?\s*([A-Za-z0-9][A-Za-z0-9._/-]{3,})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, original, flags=re.I)
+        if match:
+            return match.group(1).strip(" .,:;?")
+
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{3,}", original):
+        return original.strip(" .,:;?")
+
+    if any(k in normalize(original) for k in ("donde", "ubicacion", "ubicado", "ubicada", "colocado", "colocada")):
+        candidates = re.findall(r"\b[A-Za-z0-9][A-Za-z0-9._/-]{4,}\b", original)
+        if candidates:
+            return candidates[-1].strip(" .,:;?")
+    return ""
 
 def _edf_location_answer(raw, ctx):
     source_status = repago_source.status()
     if source_status.get("ok") is not True:
-        return "La fuente **EDF/Repago** se está actualizando con el cálculo nuevo. Probá de nuevo en unos segundos.", ["EDF · actualización automática"]
+        return "La fuente **EDF/Repago** se está actualizando. Probá de nuevo en unos segundos.", ["EDF · actualización automática"]
+
     serial = _serial_from_query(raw)
     if not serial and ctx.get("active_serial"):
         serial = str(ctx.get("active_serial") or "")
     if not serial:
-        return "Decime el **número de serie** del EDF que querés ubicar.", ["EDF · snapshot local"]
+        return "Decime el **número de serie completo o una parte de la serie** del EDF.", ["EDF · snapshot local"]
 
     row = repago_source.edf_by_serial(serial)
     if not row:
-        matches = repago_source.search_edf_serial(serial, limit=8)
-        if len(matches) > 1:
-            lines = [f"Encontré varias series parecidas a **{serial}**. Indicame cuál:"]
+        matches = repago_source.search_edf_serial(serial, limit=12)
+        if len(matches) == 1:
+            row = matches[0]
+        elif len(matches) > 1:
+            lines = [f"Encontré **{len(matches)} series** que se aproximan a **{serial}**. Indicame cuál:"]
             for r in matches:
-                lines.append(f"- **{r.get('serial') or '—'}** · {r.get('model') or '—'}")
+                cid = str(r.get("customer_id") or "").strip()
+                name = r.get("customer_name") or r.get("legal_name") or ""
+                where = f" · cliente {cid} — {name}" if cid else f" · {r.get('status') or r.get('deposit') or 'sin ubicación'}"
+                lines.append(f"- **{r.get('serial') or '—'}** · {r.get('model') or '—'}{where}")
             return "\n".join(lines), ["EDF · snapshot local"]
-        return f"No encontré un EDF con número de serie **{serial}**.", ["EDF · snapshot local"]
+        else:
+            return f"No encontré una serie que contenga **{serial}**.", ["EDF · snapshot local"]
 
     ctx["active_serial"] = row.get("serial") or serial
     cid = str(row.get("customer_id") or "").strip()
@@ -354,9 +401,7 @@ def _edf_location_answer(raw, ctx):
         location_bits = [x for x in (row.get("address"), row.get("city")) if x]
         location = " · ".join(location_bits)
         extra = f"\n{location}" if location else ""
-        return (
-            f"La serie **{serie}** · {model} está colocada en el **cliente {cid} — {name}**.{extra}"
-        ), ["EDF · snapshot local"]
+        return f"La serie **{serie}** · {model} está colocada en el **cliente {cid} — {name}**.{extra}", ["EDF · snapshot local"]
 
     status_labels = {
         "DEPOSITO": "en depósito",
@@ -385,7 +430,7 @@ def _valid_followup_entity(raw: str, ctx: dict[str, Any]) -> bool:
             return True
         return len(repago_source.search_customers(query, limit=2)) > 0
 
-    if topic == "discount":
+    if topic in {"discount", "tope"}:
         if query.isdigit() and (grupos_source.customer(query) or repago_source.customer(query)):
             return True
         return (
@@ -393,7 +438,7 @@ def _valid_followup_entity(raw: str, ctx: dict[str, Any]) -> bool:
             or len(repago_source.search_customers(query, limit=2)) > 0
         )
 
-    if topic == "frescura":
+    if topic in {"frescura", "stock"}:
         if query.isdigit() and frescura_source.product(query):
             return True
         return len(frescura_source.search_products(query, limit=2)) > 0
@@ -433,14 +478,22 @@ def _op_label(op: str, threshold: float) -> str:
     return f"{sign}{number(threshold, 0)}%"
 
 
-def _repago_count_answer(raw, ctx, forced_op=None, forced_threshold=None):
+
+def _repago_count_answer(raw, ctx, forced_op=None, forced_threshold=None, forced_mode=None):
     cust, err = _resolve_repago_customer(raw, ctx)
     if err:
         return err, ["Repagos EDF · snapshot local"]
     _set_client_context(ctx, cust)
     code = cust["id"]
     name = cust.get("name") or cust.get("legal_name") or ""
-    rows = repago_source.customer_edfs(code)
+
+    default_mode = forced_mode or ctx.get("last_repago_mode") or "trimestre"
+    mode = _repago_mode_from_text(raw, default_mode)
+    rows = [
+        r for r in repago_source.customer_repayments(code, mode=mode)
+        if str(r.get("status") or "").upper() == "PDV"
+    ]
+
     op, threshold = _repago_threshold(raw)
     if forced_op is not None:
         op = forced_op
@@ -462,14 +515,15 @@ def _repago_count_answer(raw, ctx, forced_op=None, forced_threshold=None):
 
     matches = [r for r in rows if ok(r.get("pct"))]
     if not rows:
-        return f"**Cliente {code} — {name}** no tiene EDF/heladeras asignadas.", ["Repagos EDF · snapshot local"]
+        return f"**Cliente {code} — {name}** no tiene EDF/heladeras colocadas.", ["Repagos EDF · snapshot local"]
 
-    verb = "tiene" if len(matches) == 1 else "tienen"
+    period = rows[0].get("repago_periods") or []
+    period_label = _period_label(period[-1]) if mode == "ultimo_mes" and period else _periods_label(period)
+    ctx["last_repago_mode"] = mode
     return (
-        f"De las **{len(rows)} EDF/heladeras** del **cliente {code} — {name}**, "
-        f"**{len(matches)}** {verb} repago **{_op_label(op, threshold)}**."
+        f"**Cliente {code} — {name}** · {period_label}: **{len(matches)} de {len(rows)}** EDF "
+        f"tienen repago **{_op_label(op, threshold)}**."
     ), ["Repagos EDF · snapshot local"]
-
 
 def _discount_segment(text):
     if "core" in text:
@@ -538,6 +592,76 @@ def _discount_answer(raw, ctx, requested_segment=None):
     for row in sorted(rows, key=lambda r: (_discount_label(r), r.get("porcentaje_total", 0))):
         lines.append(f"- **{_discount_label(row)}: {pct_points(row.get('porcentaje_total'))}**")
     return "\n".join(lines), ["Grupo de clientes · snapshot local"]
+
+
+
+def _tope_segment(text: str):
+    t = normalize(text)
+    if "core" in t:
+        return "CORE"
+    if "value" in t:
+        return "VALUE"
+    return None
+
+
+def _tope_answer(raw, ctx, requested_segment=None):
+    if grupos_source.status().get("ok") is not True:
+        return "La fuente de **topes Core/Value** se está actualizando. Probá de nuevo en unos segundos.", ["Planificacion · topes"]
+
+    cust, err = _resolve_group_customer(raw, ctx)
+    if err:
+        return err, ["Planificacion · topes Core/Value"]
+    _set_client_context(ctx, cust)
+    code = cust["id"]
+    name = cust.get("name") or cust.get("legal_name") or ""
+
+    segment = requested_segment or _tope_segment(raw)
+    rows = grupos_source.topes(code, segment)
+    if not rows:
+        target = f" **{segment}**" if segment else ""
+        return f"No pude determinar el tope{target} del **cliente {code} — {name}** con la información actual.", ["Planificacion · topes Core/Value"]
+
+    if segment and len(rows) == 1:
+        r = rows[0]
+        return (
+            f"**Cliente {code} — {name}** · Tope **{segment}: {number(r.get('tope_bultos'), 0)} bultos** "
+            f"(canal {r.get('canal') or '—'})."
+        ), ["Planificacion · Control bultos Core/Value"]
+
+    lines = [f"**Cliente {code} — {name}**", ""]
+    for r in rows:
+        lines.append(
+            f"- Tope **{r.get('segmento')}: {number(r.get('tope_bultos'), 0)} bultos** "
+            f"(canal {r.get('canal') or '—'})."
+        )
+    return "\n".join(lines), ["Planificacion · Control bultos Core/Value"]
+
+
+def _stock_answer(product, scope):
+    code = str(product.get("codigo") or "")
+    title = product.get("descripcion") or ""
+    if scope == "DDV":
+        stock = product.get("stock_total_ddv")
+    elif scope == "TRELEW":
+        stock = product.get("stock_trelew")
+    else:
+        stock = product.get("stock_madryn")
+    return (
+        f"**SKU {code} — {title}** · **{scope_label(scope)}**\n\n"
+        f"Stock actual: **{number(stock)} bultos**."
+    ), ["Frescura · stock snapshot local"]
+
+
+def _ask_stock_scope(product, ctx):
+    _set_sku_context(ctx, product, None)
+    ctx["pending_stock_scope"] = True
+    ctx["pending_stock_sku"] = str(product.get("codigo") or "")
+    ctx["active_topic"] = "stock"
+    return (
+        f"¿De qué localidad querés consultar el stock de **{product.get('codigo')} — {product.get('descripcion','')}**? "
+        "Decime **Trelew**, **Madryn** o **Total DDV**.",
+        [],
+    )
 
 
 def _resolve_frescura_product(raw: str, ctx: dict[str, Any]):
@@ -626,6 +750,7 @@ def _risk_answer(scope, state=None):
     return "\n".join(lines), ["Frescura Predictiva v9 · snapshot local"]
 
 
+
 def _topic_followup(raw: str, text: str, ctx: dict[str, Any], scope: str):
     """Continúa tema + cambia/retiene entidad cuando la frase no trae un intent nuevo."""
     topic = ctx.get("active_topic")
@@ -636,6 +761,12 @@ def _topic_followup(raw: str, text: str, ctx: dict[str, Any], scope: str):
         segment = ctx.get("last_discount_segment")
         answer, sources = _discount_answer(raw, ctx, segment)
         ctx["last_intent"] = f"discount:{segment or 'ALL'}"
+        return answer, sources, ctx
+
+    if topic == "tope":
+        segment = ctx.get("last_tope_segment")
+        answer, sources = _tope_answer(raw, ctx, segment)
+        ctx["last_intent"] = f"tope:{segment or 'ALL'}"
         return answer, sources, ctx
 
     if topic == "edf_count":
@@ -649,14 +780,16 @@ def _topic_followup(raw: str, text: str, ctx: dict[str, Any], scope: str):
         return answer, sources, ctx
 
     if topic == "repago":
-        answer, sources = _repago_answer(raw, ctx)
+        mode = ctx.get("last_repago_mode") or "trimestre"
+        answer, sources = _repago_answer(raw, ctx, mode)
         ctx["last_intent"] = "repago"
         return answer, sources, ctx
 
     if topic == "repago_count":
         op = ctx.get("last_repago_op")
         threshold = ctx.get("last_repago_threshold")
-        answer, sources = _repago_count_answer(raw, ctx, op, threshold)
+        mode = ctx.get("last_repago_mode") or "trimestre"
+        answer, sources = _repago_count_answer(raw, ctx, op, threshold, mode)
         ctx["last_intent"] = "repago_count"
         return answer, sources, ctx
 
@@ -674,11 +807,19 @@ def _topic_followup(raw: str, text: str, ctx: dict[str, Any], scope: str):
         ctx["last_intent"] = "frescura"
         return answer, sources, ctx
 
+    if topic == "stock":
+        product, err = _resolve_frescura_product(raw, ctx)
+        if err:
+            return err, [], ctx
+        answer, sources = _ask_stock_scope(product, ctx)
+        ctx["last_intent"] = "stock_wait_scope"
+        return answer, sources, ctx
+
     return None
 
 
 def respond(message: str, context: dict[str, Any] | None = None):
-    """Responde manteniendo por separado la entidad activa y el tema activo."""
+    """Responde manteniendo por separado entidad, tema y período."""
     ctx = _copy_context(context)
     raw = str(message or "").strip()
     text = normalize(raw)
@@ -687,9 +828,9 @@ def respond(message: str, context: dict[str, Any] | None = None):
 
     if any(k in text for k in ("ayuda", "que podes", "ejemplos")):
         return (
-            "Puedo responder **EDF/heladeras**, **ubicación por número de serie**, **Repago**, **ventas mensuales**, **Frescura** y **descuentos por segmento**. "
-            "Mantengo por separado el **cliente/SKU** y el **tema**: `descuento CORE de 275` → `¿y el 3992?` sigue preguntando CORE; "
-            "`cuántas heladeras tiene 4895` → `¿cuántas repagan más del 75%?` sigue con ese cliente.",
+            "Puedo responder **EDF/heladeras**, **ubicación por número de serie**, **Repago por trimestre o último mes**, "
+            "**ventas mensuales**, **stock/Frescura**, **descuentos** y **topes de bultos Core/Value**. "
+            "Si una pregunta no es clara, te voy a pedir precisión en vez de adivinar.",
             [], ctx,
         )
 
@@ -706,42 +847,101 @@ def respond(message: str, context: dict[str, Any] | None = None):
         and not repago_words
     )
 
-    # 1) Ubicación de EDF por número de serie. Tiene prioridad sobre códigos de cliente/SKU.
-    serial_intent = any(k in text for k in ("serie", "serial", "numero de serie", "nro serie", "nro de serie"))
+    # 0) Respuesta a la repregunta de localidad para stock.
+    if ctx.get("pending_stock_scope") and explicit_scope and not code:
+        sku = str(ctx.get("pending_stock_sku") or ctx.get("active_sku") or "")
+        product = frescura_source.product(sku) if sku else None
+        if product:
+            ctx["pending_stock_scope"] = False
+            ctx["pending_stock_sku"] = None
+            _set_sku_context(ctx, product, explicit_scope)
+            ctx.update({"active_topic": "stock", "last_intent": "stock"})
+            answer, sources = _stock_answer(product, explicit_scope)
+            return answer, sources, ctx
+
+    # Si el usuario abandona la repregunta y hace otra consulta, no dejamos un stock pendiente viejo.
+    if ctx.get("pending_stock_scope"):
+        ctx["pending_stock_scope"] = False
+        ctx["pending_stock_sku"] = None
+
+    # 1) Ubicación de EDF por serie completa o parcial.
+    serial_candidate = _serial_from_query(raw)
+    location_words = any(k in text for k in ("donde", "ubicacion", "ubicado", "ubicada", "colocado", "colocada"))
+    serial_words = any(k in text for k in ("serie", "serial", "numero de serie", "nro serie", "nro de serie"))
+    serial_followup = ctx.get("active_topic") == "edf_location" and bool(serial_candidate)
+    serial_intent = serial_words or (location_words and asset_words and bool(serial_candidate)) or serial_followup
     if serial_intent:
         answer, sources = _edf_location_answer(raw, ctx)
         ctx.update({"active_topic": "edf_location", "last_intent": "edf_location"})
         return answer, sources, ctx
 
-    # 2) Repago cuantitativo explícito.
+    # 2) Cambio de período dentro de un hilo de Repago.
+    period_change = any(k in text for k in ("ultimo mes", "mes corriente", "mes actual", "este mes", "trimestre", "promedio"))
+    if period_change and ctx.get("active_topic") in {"repago", "repago_count"} and ctx.get("active_client_id"):
+        mode = _repago_mode_from_text(raw, ctx.get("last_repago_mode") or "trimestre")
+        if ctx.get("active_topic") == "repago_count":
+            answer, sources = _repago_count_answer(
+                raw, ctx,
+                ctx.get("last_repago_op"),
+                ctx.get("last_repago_threshold"),
+                mode,
+            )
+        else:
+            answer, sources = _repago_answer(raw, ctx, mode)
+        ctx["last_repago_mode"] = mode
+        ctx["last_intent"] = ctx.get("active_topic")
+        return answer, sources, ctx
+
+    # 3) Repago cuantitativo explícito.
     if repago_words and count_words:
         op, threshold = _repago_threshold(raw)
-        answer, sources = _repago_count_answer(raw, ctx, op, threshold)
+        mode = _repago_mode_from_text(raw, ctx.get("last_repago_mode") or "trimestre")
+        answer, sources = _repago_count_answer(raw, ctx, op, threshold, mode)
         ctx.update({
             "active_topic": "repago_count", "last_intent": "repago_count",
             "last_repago_op": op, "last_repago_threshold": threshold,
+            "last_repago_mode": mode,
         })
         return answer, sources, ctx
 
-    # 3) Conteo de EDF explícito.
+    # 4) Conteo de EDF explícito.
     if asset_words and count_words and not repago_words:
         answer, sources = _edf_count_answer(raw, ctx)
         ctx.update({"active_topic": "edf_count", "last_intent": "edf_count"})
         return answer, sources, ctx
 
-    # 4) Repago explícito.
+    # 5) Repago explícito.
     if repago_words:
-        answer, sources = _repago_answer(raw, ctx)
-        ctx.update({"active_topic": "repago", "last_intent": "repago"})
+        mode = _repago_mode_from_text(raw, ctx.get("last_repago_mode") or "trimestre")
+        answer, sources = _repago_answer(raw, ctx, mode)
+        ctx.update({"active_topic": "repago", "last_intent": "repago", "last_repago_mode": mode})
         return answer, sources, ctx
 
-    # 5) Compra/venta mensual del cliente.
+    # 6) Compra/venta mensual del cliente.
     if monthly_sales_words:
         answer, sources = _monthly_sales_answer(raw, ctx)
         ctx.update({"active_topic": "monthly_sales", "last_intent": "monthly_sales"})
         return answer, sources, ctx
 
-    # 6) Descuentos explícitos.
+    # 7) Topes de bultos Core/Value. Tiene prioridad sobre descuento.
+    tope_intent = (
+        "tope" in text
+        or ("bulto" in text and any(k in text for k in ("core", "value")))
+        or (ctx.get("active_topic") == "tope" and _tope_segment(text) is not None and "descuento" not in text)
+    )
+    if tope_intent:
+        segment = _tope_segment(text)
+        if segment is None and ctx.get("active_topic") == "tope":
+            segment = ctx.get("last_tope_segment")
+        answer, sources = _tope_answer(raw, ctx, segment)
+        ctx.update({
+            "active_topic": "tope",
+            "last_tope_segment": segment,
+            "last_intent": f"tope:{segment or 'ALL'}",
+        })
+        return answer, sources, ctx
+
+    # 8) Descuentos explícitos.
     discount_intent = (
         "descuento" in text or "porcentaje" in text or "core" in text or "value" in text
         or ("litro" in text and ctx.get("active_client_id"))
@@ -749,7 +949,6 @@ def respond(message: str, context: dict[str, Any] | None = None):
     )
     if discount_intent:
         requested_segment = _discount_segment(text)
-        # "y el 3992" no entra acá; pero "y VALUE LATA" sí cambia el subtema.
         if requested_segment is None and ctx.get("active_topic") == "discount":
             requested_segment = ctx.get("last_discount_segment")
         answer, sources = _discount_answer(raw, ctx, requested_segment)
@@ -760,7 +959,32 @@ def respond(message: str, context: dict[str, Any] | None = None):
         })
         return answer, sources, ctx
 
-    # 7) Frescura explícita.
+    # 9) Stock: si no dice localidad, SIEMPRE se pregunta antes de responder.
+    if "stock" in text:
+        product, err = _resolve_frescura_product(raw, ctx)
+        if err:
+            return err, [], ctx
+        if explicit_scope is None:
+            answer, sources = _ask_stock_scope(product, ctx)
+            ctx["last_intent"] = "stock_wait_scope"
+            return answer, sources, ctx
+        ctx["pending_stock_scope"] = False
+        ctx["pending_stock_sku"] = None
+        _set_sku_context(ctx, product, explicit_scope)
+        answer, sources = _stock_answer(product, explicit_scope)
+        ctx.update({"active_topic": "stock", "last_intent": "stock"})
+        return answer, sources, ctx
+
+    # Si veníamos hablando de stock y sólo cambia la localidad, mantenemos el SKU y respondemos stock.
+    if ctx.get("active_topic") == "stock" and explicit_scope and ctx.get("active_sku"):
+        product = frescura_source.product(str(ctx.get("active_sku")))
+        if product:
+            _set_sku_context(ctx, product, explicit_scope)
+            answer, sources = _stock_answer(product, explicit_scope)
+            ctx.update({"active_topic": "stock", "last_intent": "stock"})
+            return answer, sources, ctx
+
+    # 10) Frescura explícita.
     if any(k in text for k in ("critico", "criticos")) and not code:
         answer, sources = _risk_answer(scope, state="CRITICO")
         ctx.update({"active_scope": scope, "active_topic": "frescura", "last_intent": "frescura_criticos"})
@@ -770,8 +994,13 @@ def respond(message: str, context: dict[str, Any] | None = None):
         ctx.update({"active_scope": scope, "active_topic": "frescura", "last_intent": "frescura_accionar"})
         return answer, sources, ctx
 
-    frescura_words = any(k in text for k in ("riesgo", "frescura", "venc", "stock", "lote"))
-    frescura_followup = explicit_scope is not None and ctx.get("active_sku") is not None
+    frescura_words = any(k in text for k in ("riesgo", "frescura", "venc", "lote"))
+    frescura_followup = (
+        ctx.get("active_topic") == "frescura"
+        and explicit_scope is not None
+        and ctx.get("active_sku") is not None
+        and not ctx.get("pending_stock_scope")
+    )
     if frescura_words or frescura_followup:
         product, err = _resolve_frescura_product(raw, ctx)
         if err:
@@ -781,29 +1010,29 @@ def respond(message: str, context: dict[str, Any] | None = None):
         ctx.update({"active_topic": "frescura", "last_intent": "frescura"})
         return answer, sources, ctx
 
-    # 8) Seguimiento corto de umbral: conserva cliente y actualiza tema.
+    # 11) Seguimiento corto de umbral.
     if ctx.get("active_client_id") and count_words and re.search(r"\b\d{1,3}\s*%", text):
         op, threshold = _repago_threshold(raw)
-        answer, sources = _repago_count_answer(raw, ctx, op, threshold)
+        mode = ctx.get("last_repago_mode") or "trimestre"
+        answer, sources = _repago_count_answer(raw, ctx, op, threshold, mode)
         ctx.update({
             "active_topic": "repago_count", "last_intent": "repago_count",
             "last_repago_op": op, "last_repago_threshold": threshold,
         })
         return answer, sources, ctx
 
-    # 9) Frases sin tema nuevo ("y el 3992?", "¿y Cárdenas Varas?").
-    # Si hay una entidad nueva o una referencia corta, conserva el tema activo.
+    # 12) Seguimiento de tema con una entidad nueva válida.
     if ctx.get("active_topic") and _valid_followup_entity(raw, ctx):
         result = _topic_followup(raw, text, ctx, scope)
         if result is not None:
             return result
 
-    # 10) Código suelto sin tema previo: no adivina qué quiso preguntar el usuario.
+    # 13) Código suelto sin tema previo: no adivina.
     if code:
         customer_match = repago_source.customer(code) or grupos_source.customer(code)
         product_match = frescura_source.product(code)
-        serial_match = repago_source.edf_by_serial(code)
-        found = sum(bool(x) for x in (customer_match, product_match, serial_match))
+        serial_matches = repago_source.search_edf_serial(code, limit=3)
+        found = bool(customer_match or product_match or serial_matches)
         if found:
             options = []
             if customer_match:
@@ -811,21 +1040,21 @@ def respond(message: str, context: dict[str, Any] | None = None):
                 options.append(f"cliente **{code} — {cname}**")
             if product_match:
                 options.append(f"SKU **{code} — {product_match.get('descripcion','')}**")
-            if serial_match:
-                options.append(f"serie EDF **{serial_match.get('serial') or code}**")
+            if serial_matches:
+                options.append(f"{len(serial_matches)} coincidencia(s) de serie EDF")
             return (
                 "Identifiqué " + ", ".join(options) + ", pero **no sé qué querés consultar**. "
-                "Indicame si querés ver EDF, repago, descuentos, ubicación por serie o frescura.",
+                "Indicame si querés ver EDF, repago, topes, descuentos, ubicación por serie, stock o frescura.",
                 [], ctx,
             )
 
     return (
         "**No entendí qué querés consultar.** No voy a asumir una respuesta. "
         "Podés preguntarme, por ejemplo: `cuántas heladeras tiene CLIENTE`, `repago CLIENTE`, "
-        "`dónde está la serie XXXXX`, `qué descuento CORE tiene CLIENTE`, `cuánto compró CLIENTE en el mes` o `frescura SKU`.",
+        "`repago CLIENTE último mes`, `dónde está el EDF 565964`, `tope CORE de CLIENTE`, "
+        "`descuento CORE de CLIENTE`, `stock SKU` o `frescura SKU`.",
         [], ctx,
     )
-
 
 def refresh_all():
     result = {}
