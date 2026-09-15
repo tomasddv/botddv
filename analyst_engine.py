@@ -383,6 +383,35 @@ def _is_purchase_date_question(q: str) -> bool:
     return any(phrase in qn for phrase in phrases)
 
 
+def _is_purchase_contents_question(q: str) -> bool:
+    """Detecta preguntas sobre *qué* compró un cliente, no *cuándo*.
+
+    Ejemplos: "qué compró el 891", "qué productos compró el cliente 891",
+    "qué le vendimos al cliente 891". Se resuelve contra Venta mes actual (CHESS).
+    """
+    qn = _norm(q)
+    if _is_purchase_date_question(qn):
+        return False
+    phrases = (
+        "que compro", "que compra", "que productos compro", "cuales productos compro",
+        "que sku compro", "cuales sku compro", "que le vendimos", "que le vendio",
+        "que se llevo", "que llevo",
+    )
+    # "cuánto compró" es una consulta de total, no de surtido/productos.
+    if any(k in qn for k in ("cuanto compro", "cuanto compra", "cuanto le vendimos")):
+        return False
+    return any(phrase in qn for phrase in phrases)
+
+
+def _is_purchase_amount_question(q: str) -> bool:
+    """Detecta consultas naturales de total comprado por un cliente."""
+    qn = _norm(q)
+    return any(k in qn for k in (
+        "cuanto compro", "cuanto compra", "cuanto le vendimos",
+        "cuanto le vendio", "cuanto se llevo",
+    ))
+
+
 def should_analyze(question: str) -> bool:
     """Deriva al analista local preguntas de conjuntos, comparaciones, rankings y cruces."""
     q = _norm(question)
@@ -427,12 +456,14 @@ def should_analyze(question: str) -> bool:
         "no vendio", "no vendieron", "no compro", "no compraron"
     ))
     purchase_date = _is_purchase_date_question(q)
+    purchase_contents = _is_purchase_contents_question(q)
+    purchase_amount = _is_purchase_amount_question(q)
     freshness_month_list = (
         "frescura" in q
         and ("mes" in q or bool(_extract_freshness_months(q)))
         and any(k in q for k in ("producto", "productos", "sku", "venc", "frescura"))
     )
-    return current_sales or plural_or_set or comparative or aggregate or cross_source or correction_followup or zero_repago or purchase_date or freshness_month_list
+    return current_sales or plural_or_set or comparative or aggregate or cross_source or correction_followup or zero_repago or purchase_date or purchase_contents or purchase_amount or freshness_month_list
 
 
 def _extract_limit(q: str, default: int = 15) -> int:
@@ -1649,6 +1680,64 @@ def _current_sales_plan(q: str, context: dict[str, Any] | None = None) -> dict |
             "clarifying_question":"", "reason":"",
         }
 
+    # Consulta de surtido comprado: "qué compró el 891" / "qué productos compró el cliente 891".
+    # El número se interpreta prioritariamente como cliente y se devuelve el detalle por SKU.
+    if _is_purchase_contents_question(q):
+        cust = _match_sales_customer(q, context)
+        if not cust:
+            return {
+                "action":"clarify", "title":"", "sql":"", "assumption":"",
+                "clarifying_question":"¿De qué **cliente** querés ver los productos comprados?",
+                "reason":"falta cliente para consulta de productos comprados",
+            }
+
+        # Construimos filtros seguros sin inferir un SKU a partir del mismo número del cliente.
+        purchase_filters = [f"v.cliente_codigo={_sql_text(cust[0])}"]
+        purchase_notes = [f"cliente {cust[0]} · {cust[1]}" if cust[1] else f"cliente {cust[0]}"]
+
+        loc = _location(q)
+        if loc in {"TRELEW", "MADRYN"}:
+            purchase_filters.append(f"UPPER(v.localidad_base)={_sql_text(loc)}")
+            purchase_notes.append(loc.title())
+
+        focus_cond, focus_label = _sales_focus_condition(q, "v")
+        if focus_cond:
+            purchase_filters.append(focus_cond)
+            purchase_notes.append(focus_label)
+
+        generic_cond, generic_label = _generic_sales_dimension_condition(q, "v")
+        if generic_cond:
+            purchase_filters.append(generic_cond)
+            purchase_notes.append(generic_label)
+
+        time_cond, time_label = _sales_time_condition(q, "v")
+        if time_cond:
+            purchase_filters.append(time_cond)
+            purchase_notes.append(time_label)
+
+        purchase_where = "WHERE " + " AND ".join(purchase_filters)
+        sql = f"""
+            SELECT v.sku,
+                   MAX(v.producto) AS producto,
+                   ROUND(SUM(v.hl),2) AS hl,
+                   ROUND(SUM(v.importe_neto),2) AS importe_neto,
+                   ROUND(SUM(v.facturas),0) AS facturas,
+                   MAX(DATE(v.fecha)) AS ultima_compra
+            FROM ventas_mes_actual v
+            {purchase_where}
+            GROUP BY v.sku
+            HAVING SUM(v.hl) > 0 OR SUM(v.importe_neto) > 0
+            ORDER BY MAX(DATE(v.fecha)) DESC, SUM(v.hl) DESC, v.sku ASC
+        """
+        title = f"Productos comprados en el mes · cliente {cust[0]}"
+        if cust[1]:
+            title += f" · {cust[1]}"
+        return {
+            "action":"query", "title":title, "sql":sql,
+            "assumption": period_note + " Se listan todos los SKU con compra neta positiva para el cliente solicitado.",
+            "clarifying_question":"", "reason":"", "display_all":True,
+        }
+
     # Varias unidades de negocio pedidas explícitamente: detalle + TOTAL de las elegidas.
     # Ej.: "cuánto llevamos Marketplace, Aguas y Red Bull en pesos/HL".
     if len(requested_units) >= 2:
@@ -2178,6 +2267,7 @@ FRIENDLY = {
     "importe_final": "Importe final",
     "facturas": "Facturas",
     "fecha": "Fecha",
+    "ultima_compra": "Última compra",
     "sku": "SKU",
     "producto": "Producto",
     "vendedor": "Vendedor",
