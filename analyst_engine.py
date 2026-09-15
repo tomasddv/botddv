@@ -887,48 +887,109 @@ def _generic_sales_dimension_condition(q: str, alias: str = "v") -> tuple[str, s
 
 
 def _requested_business_units(q: str, alias: str = "v") -> list[tuple[str, str]]:
-    """Devuelve unidades de negocio explícitamente mencionadas en la pregunta.
+    """Devuelve negocios explícitamente mencionados en la pregunta.
 
-    Cada elemento es (etiqueta, condición SQL). Se apoya primero en los valores
-    reales de `unidad_negocio` presentes en el snapshot y suma alias comerciales
-    frecuentes (CZA, UNG y AGUAS).
+    Agrupa alias comerciales que pueden corresponder a más de un valor real de
+    `unidad_negocio` (por ejemplo MARKETPLACE) y evita que una consulta con
+    varios negocios termine combinándolos como filtros AND.
     """
     qn = _norm(q)
     p = alias + "." if alias else ""
+    rows = _sales_rows()
     found: list[tuple[str, str]] = []
     seen: set[str] = set()
 
-    # Valores reales de Unidad de Negocio disponibles en el snapshot actual.
-    values: dict[str, str] = {}
-    for row in _sales_rows():
-        raw = str(row.get("unidad_negocio") or "").strip()
-        if raw:
-            values.setdefault(_norm(raw), raw)
-
-    for norm_value, raw in sorted(values.items(), key=lambda kv: (-len(kv[0]), kv[0])):
-        if not norm_value:
-            continue
-        # Coincidencia por frase completa para evitar falsos positivos.
-        if re.search(rf"(^|\b){re.escape(norm_value)}(\b|$)", qn):
-            label = raw
-            key = _norm(label)
-            if key not in seen:
-                escaped = raw.replace("'", "''").upper()
-                found.append((label, f"UPPER({p}unidad_negocio)='{escaped}'"))
-                seen.add(key)
-
-    aliases = [
-        ("CZA", bool(re.search(r"\bcza\b", qn) or "cerveza" in qn), f"{p}es_cza=1"),
-        ("UNG", bool(re.search(r"\bung\b", qn)), f"UPPER({p}unidad_negocio) LIKE '%UNG%'"),
-        ("AGUAS", bool(re.search(r"\bagua(?:s)?\b", qn)), f"UPPER({p}division)='AGUAS'"),
-    ]
-    for label, present, condition in aliases:
-        if present and _norm(label) not in seen:
+    def add(label: str, condition: str) -> None:
+        key = _norm(label)
+        if key and key not in seen:
             found.append((label, condition))
-            seen.add(_norm(label))
+            seen.add(key)
+
+    def distinct_values(field: str) -> list[str]:
+        vals = []
+        seen_vals = set()
+        for row in rows:
+            raw = str(row.get(field) or "").strip()
+            if not raw:
+                continue
+            key = _norm(raw)
+            if key and key not in seen_vals:
+                vals.append(raw)
+                seen_vals.add(key)
+        return vals
+
+    def in_condition(field: str, values: list[str]) -> str:
+        quoted = ",".join(_sql_text(v.upper()) for v in values)
+        return f"UPPER({p}{field}) IN ({quoted})"
+
+    unit_values = distinct_values("unidad_negocio")
+
+    # 1) Valores reales completos mencionados literalmente.
+    for raw in sorted(unit_values, key=lambda x: (-len(_norm(x)), _norm(x))):
+        nv = _norm(raw)
+        if nv and re.search(rf"(^|\b){re.escape(nv)}(\b|$)", qn):
+            add(raw, f"UPPER({p}unidad_negocio)={_sql_text(raw.upper())}")
+
+    # 2) Alias/grupos comerciales habituales. MARKETPLACE puede tener varias
+    # variantes reales (p.ej. Marketplace Bees y Marketplace Alimentos).
+    if re.search(r"\bmarket\s*place\b|\bmarketplace\b", qn):
+        matches = [v for v in unit_values if "marketplace" in _norm(v).replace(" ", "")]
+        if matches:
+            add("MARKETPLACE", in_condition("unidad_negocio", matches))
+        else:
+            add("MARKETPLACE", f"UPPER({p}unidad_negocio) LIKE '%MARKETPLACE%'")
+
+    if re.search(r"\bred\s*bull\b|\bredbull\b", qn):
+        # Preferimos Unidad de Negocio si existe como tal en el snapshot.
+        rb_units = [v for v in unit_values if "redbull" in _norm(v).replace(" ", "")]
+        if rb_units:
+            add("RED BULL", in_condition("unidad_negocio", rb_units))
+        else:
+            # Fallback seguro cuando el archivo lo identifica por marca.
+            brand_values = distinct_values("marca_unificada") + distinct_values("marca")
+            rb_brands = []
+            used = set()
+            for v in brand_values:
+                if "redbull" in _norm(v).replace(" ", "") and _norm(v) not in used:
+                    rb_brands.append(v)
+                    used.add(_norm(v))
+            if rb_brands:
+                conds = []
+                mu = [v for v in distinct_values("marca_unificada") if "redbull" in _norm(v).replace(" ", "")]
+                ma = [v for v in distinct_values("marca") if "redbull" in _norm(v).replace(" ", "")]
+                if mu:
+                    conds.append(in_condition("marca_unificada", mu))
+                if ma:
+                    conds.append(in_condition("marca", ma))
+                add("RED BULL", "(" + " OR ".join(conds) + ")")
+            else:
+                add("RED BULL", f"REPLACE(UPPER({p}unidad_negocio),' ','') LIKE '%REDBULL%'")
+
+    # Aguas se maneja como negocio comercial aunque la fuente la identifique
+    # por División. Si hubiera una unidad real llamada Aguas, se prioriza.
+    if re.search(r"\bagua(?:s)?\b", qn):
+        agua_units = [v for v in unit_values if re.search(r"\bagua(?:s)?\b", _norm(v))]
+        if agua_units:
+            add("AGUAS", in_condition("unidad_negocio", agua_units))
+        else:
+            add("AGUAS", f"UPPER({p}division)='AGUAS'")
+
+    if re.search(r"\bcza\b", qn) or "cerveza" in qn:
+        add("CZA", f"{p}es_cza=1")
+
+    if re.search(r"\bung\b", qn):
+        add("UNG", f"UPPER({p}unidad_negocio) LIKE '%UNG%'")
 
     return found
 
+
+def _requested_sales_metrics(q: str) -> tuple[bool, bool, bool]:
+    """Indica si la pregunta pide HL, pesos y/o facturas de forma explícita."""
+    qn = _norm(q)
+    wants_money = any(k in qn for k in ("importe", "pesos", "facturacion", "monto", "dinero")) or "$" in q
+    wants_hl = bool(re.search(r"\bhl\b|hectolitro", qn))
+    wants_invoices = "factura" in qn and any(k in qn for k in ("cuantas", "cantidad", "facturas"))
+    return wants_hl, wants_money, wants_invoices
 
 def _sales_filters(q: str, context: dict[str, Any] | None = None, alias: str = "v", include_business_focus: bool = True) -> tuple[list[str], list[str]]:
     p = alias + "." if alias else ""
@@ -1208,37 +1269,51 @@ def _current_sales_plan(q: str, context: dict[str, Any] | None = None) -> dict |
     period_note = _sales_period_note()
 
     # Varias unidades de negocio pedidas explícitamente: detalle + TOTAL de las elegidas.
-    # Ej.: "cuánto llevamos CZA, UNG y Aguas en pesos/HL".
+    # Ej.: "cuánto llevamos Marketplace, Aguas y Red Bull en pesos/HL".
     if len(requested_units) >= 2:
         base_filters, base_notes = _sales_filters(q, context, "v", include_business_focus=False)
         base_where = (" AND ".join(base_filters)) if base_filters else "1=1"
-        value_expr = "v.importe_neto" if metric_alias == "importe_neto" else ("v.facturas" if metric_alias == "facturas" else "v.hl")
+        wants_hl, wants_money, wants_invoices = _requested_sales_metrics(q)
+
+        # Si no especifica métrica, mostramos las dos métricas comerciales principales.
+        if not wants_hl and not wants_money and not wants_invoices:
+            wants_hl = True
+            wants_money = True
+
+        metric_specs = []
+        if wants_hl:
+            metric_specs.append(("hl", "v.hl", "HL"))
+        if wants_money:
+            metric_specs.append(("importe_neto", "v.importe_neto", "importe neto"))
+        if wants_invoices:
+            metric_specs.append(("facturas", "v.facturas", "facturas"))
+
         detail_parts = []
-        selected_conditions = []
         for label, condition in requested_units:
             safe_label = label.replace("'", "''")
+            sums = ", ".join(f"SUM({expr}) AS {alias_name}" for alias_name, expr, _ in metric_specs)
             detail_parts.append(
-                f"SELECT '{safe_label}' AS unidad_negocio, SUM({value_expr}) AS valor, 0 AS orden "
+                f"SELECT '{safe_label}' AS unidad_negocio, {sums}, 0 AS orden "
                 f"FROM ventas_mes_actual v WHERE ({base_where}) AND ({condition})"
             )
-            selected_conditions.append(f"({condition})")
-        selected_or = " OR ".join(selected_conditions)
+
         detail_sql = " UNION ALL ".join(detail_parts)
+        total_sums = ", ".join(f"SUM({alias_name}) AS {alias_name}" for alias_name, _, _ in metric_specs)
+        out_cols = ", ".join(f"ROUND({alias_name},2) AS {alias_name}" for alias_name, _, _ in metric_specs)
         sql = f"""
             WITH detalle AS (
                 {detail_sql}
             ), salida AS (
-                SELECT unidad_negocio, valor, orden FROM detalle
+                SELECT * FROM detalle
                 UNION ALL
-                SELECT 'TOTAL' AS unidad_negocio, SUM({value_expr}) AS valor, 1 AS orden
-                FROM ventas_mes_actual v
-                WHERE ({base_where}) AND ({selected_or})
+                SELECT 'TOTAL' AS unidad_negocio, {total_sums}, 1 AS orden FROM detalle
             )
-            SELECT unidad_negocio, ROUND(valor,2) AS {metric_alias}
+            SELECT unidad_negocio, {out_cols}
             FROM salida
-            ORDER BY orden ASC, valor DESC
+            ORDER BY orden ASC, unidad_negocio ASC
         """
-        title = f"Venta del mes por unidades de negocio · {metric_label} + TOTAL"
+        metric_title = " + ".join(label for _, _, label in metric_specs)
+        title = f"Venta del mes por unidades de negocio · {metric_title} + TOTAL"
         if base_notes:
             title += " · " + " · ".join(base_notes)
         return {"action":"query", "title":title, "sql":sql, "assumption":period_note, "clarifying_question":"", "reason":""}
@@ -1309,24 +1384,40 @@ def _current_sales_plan(q: str, context: dict[str, Any] | None = None) -> dict |
         # inferido desde la misma pregunta: mostramos el detalle completo y el TOTAL.
         unit_filters, unit_notes = _sales_filters(q, context, "v", include_business_focus=False)
         unit_where = ("WHERE " + " AND ".join(unit_filters)) if unit_filters else ""
-        value_expr = "v.importe_neto" if metric_alias == "importe_neto" else ("v.facturas" if metric_alias == "facturas" else "v.hl")
+        wants_hl, wants_money, wants_invoices = _requested_sales_metrics(q)
+        if not wants_hl and not wants_money and not wants_invoices:
+            wants_hl = True
+            wants_money = True
+
+        metric_specs = []
+        if wants_hl:
+            metric_specs.append(("hl", "v.hl", "HL"))
+        if wants_money:
+            metric_specs.append(("importe_neto", "v.importe_neto", "importe neto"))
+        if wants_invoices:
+            metric_specs.append(("facturas", "v.facturas", "facturas"))
+
+        detail_sums = ", ".join(f"SUM({expr}) AS {alias_name}" for alias_name, expr, _ in metric_specs)
+        total_sums = ", ".join(f"SUM({alias_name}) AS {alias_name}" for alias_name, _, _ in metric_specs)
+        out_cols = ", ".join(f"ROUND({alias_name},2) AS {alias_name}" for alias_name, _, _ in metric_specs)
         sql=f"""
             WITH detalle AS (
                 SELECT COALESCE(NULLIF(v.unidad_negocio,''),'SIN UNIDAD') AS unidad_negocio,
-                       SUM({value_expr}) AS valor
+                       {detail_sums}
                 FROM ventas_mes_actual v
                 {unit_where}
                 GROUP BY COALESCE(NULLIF(v.unidad_negocio,''),'SIN UNIDAD')
             ), salida AS (
-                SELECT unidad_negocio, valor, 0 AS orden FROM detalle
+                SELECT *, 0 AS orden FROM detalle
                 UNION ALL
-                SELECT 'TOTAL' AS unidad_negocio, SUM(valor) AS valor, 1 AS orden FROM detalle
+                SELECT 'TOTAL' AS unidad_negocio, {total_sums}, 1 AS orden FROM detalle
             )
-            SELECT unidad_negocio, ROUND(valor,2) AS {metric_alias}
+            SELECT unidad_negocio, {out_cols}
             FROM salida
-            ORDER BY orden ASC, valor DESC
+            ORDER BY orden ASC, unidad_negocio ASC
         """
-        title=f"Venta del mes por unidad de negocio · {metric_label} + TOTAL"
+        metric_title = " + ".join(label for _, _, label in metric_specs)
+        title=f"Venta del mes por unidad de negocio · {metric_title} + TOTAL"
         if unit_notes:
             title += " · " + " · ".join(unit_notes)
         return {"action":"query", "title":title, "sql":sql, "assumption":period_note, "clarifying_question":"", "reason":""}
