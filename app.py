@@ -5,14 +5,16 @@ import time
 import streamlit as st
 
 from assistant_engine import respond, statuses
+from analyst_engine import analyst_status
 from auto_refresh import (
+    ensure_initial_ready,
     force_refresh_async,
     interval_minutes,
     start_background_updater,
     state as auto_state,
 )
 
-st.set_page_config(page_title="Asistente DDV · Consultas rápidas", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Asistente DDV · Analista Comercial", page_icon="⚡", layout="wide")
 
 st.markdown("""
 <style>
@@ -48,14 +50,23 @@ if password:
             st.error("Clave incorrecta.")
         st.stop()
 
-# Sin botones previos: si falta una fuente, se intenta preparar automáticamente.
+missing_before = [s for s in statuses() if s.get("ok") is not True]
+if missing_before:
+    with st.spinner("Preparando automáticamente las fuentes que faltan..."):
+        initial_results = ensure_initial_ready()
+    failed_initial = {k: v for k, v in initial_results.items() if v != "OK"}
+    if failed_initial:
+        st.warning("Alguna fuente no pudo actualizarse todavía. El asistente seguirá usando las fuentes disponibles y volverá a intentarlo automáticamente.")
+else:
+    ensure_initial_ready()
+
 start_background_updater()
 
 st.markdown(f"""
 <div class="hero">
-  <div class="eyebrow">ASISTENTE DDV · MODO RÁPIDO</div>
-  <h1>EDF + Repago + Frescura + Descuentos + Topes</h1>
-  <p>Responde desde snapshots locales y mantiene las fuentes actualizadas automáticamente cada {interval_minutes()} minutos.</p>
+  <div class="eyebrow">ASISTENTE DDV · RÁPIDO + ANALISTA</div>
+  <h1>Asistente Comercial DDV</h1>
+  <p>Consultas rápidas desde snapshots locales y análisis libre para comparar, cruzar y calcular sobre tus datos.</p>
 </div>
 <div class="fast-note"><b>⚡ Respuesta rápida:</b> una pregunta nunca espera Drive/GitHub ni recalcula Frescura. La actualización corre sola en segundo plano.</div>
 """, unsafe_allow_html=True)
@@ -72,6 +83,12 @@ with st.sidebar:
         st.caption(f"Última sincronización: {auto.get('last_finished')}")
     if auto.get("next_run"):
         st.caption(f"Próxima: {auto.get('next_run')}")
+
+    st.markdown("---")
+    st.subheader("Analista DDV")
+    astatus = analyst_status()
+    st.success(f"🧠 Activo · {astatus.get('model')}")
+    st.caption("Analiza comparaciones, rankings y cruces localmente. No usa API y no tiene costo por consulta.")
 
     st.markdown("---")
     st.subheader("Contexto del chat")
@@ -92,7 +109,10 @@ with st.sidebar:
         "repago": "Repago mensual",
         "repago_count": "Conteo por repago",
         "monthly_sales": "Compra mensual",
-        "frescura": "Frescura", "stock": "Stock", "tope": "Topes Core/Value", "edf_location": "Ubicación EDF",
+        "frescura": "Frescura",
+        "analyst": "Análisis libre",
+        "tope": "Tope de bultos",
+        "edf_location": "Ubicación EDF",
     }
     if topic:
         extra = ""
@@ -119,16 +139,16 @@ with st.sidebar:
                 st.info("Ya hay una actualización en curso.")
 
 source_status = statuses()
-cols = st.columns(len(source_status))
+cols = st.columns(3)
 for col, item in zip(cols, source_status):
     with col:
         state = item.get("ok")
         if state is True:
-            css, label = "source-ok", "● DATOS DISPONIBLES"
+            css, label = "source-ok", "● LISTO"
         elif state is None:
             css, label = "source-idle", "● PREPARANDO"
         else:
-            css, label = "source-idle", "● SIN DATOS DISPONIBLES"
+            css, label = "source-bad", "● ERROR"
         st.markdown(
             f'<div class="source-card"><div class="{css}">{label}</div><b>{item.get("name")}</b><br>'
             f'<span class="small-muted">{item.get("detail","")}</span><br>'
@@ -148,8 +168,7 @@ if ctx.get("active_sku"):
 if ctx.get("active_topic"):
     label = {
         "discount":"Descuentos", "edf_count":"Cantidad EDF", "repago":"Repago mensual",
-        "repago_count":"Conteo repago", "monthly_sales":"Compra mensual", "frescura":"Frescura",
-        "stock":"Stock", "tope":"Topes Core/Value", "edf_location":"Ubicación EDF",
+        "repago_count":"Conteo repago", "monthly_sales":"Compra mensual", "frescura":"Frescura", "tope":"Tope de bultos", "edf_location":"Ubicación EDF", "analyst":"Análisis libre",
     }.get(ctx.get("active_topic"), ctx.get("active_topic"))
     if ctx.get("active_topic") == "discount" and ctx.get("last_discount_segment"):
         label += f" · {ctx.get('last_discount_segment')}"
@@ -161,10 +180,10 @@ if "messages" not in st.session_state or not st.session_state.messages:
     st.session_state.messages = [{
         "role":"assistant",
         "content":(
-            "Preguntame por **cantidad de EDF/heladeras**, **Repago mensual**, **compra mensual**, **Frescura** o **descuentos por segmento**. "
-            "Mantengo **cliente + tema** por separado: `descuento CORE de 275` → `¿y el 3992?` consulta CORE del 3992; "
-            "`cuántas heladeras tiene 4895` → `¿cuántas repagan más del 75%?` sigue con el 4895. "
-            "También podés buscar clientes por **nombre de fantasía o razón social**."
+            "👋 **¡Hola! Bienvenido al Asistente Comercial DDV.**  \n\n"
+            "Podés preguntarme directamente lo que necesites sobre **stock, frescura, EDF, repago, ventas mensuales, descuentos y topes**. "
+            "También puedo **comparar bases, hacer rankings, cruzar fuentes y calcular relaciones** aunque la pregunta no esté programada de antemano.  \n\n"
+            "Voy a mantener el contexto de la conversación. **¿Qué querés analizar?**"
         ),
     }]
 
@@ -177,7 +196,7 @@ for msg in st.session_state.messages:
         if msg.get("sources"):
             st.caption("Fuente: " + " · ".join(msg["sources"]))
 
-prompt = st.chat_input("Ej.: descuento CORE de EL DELFIN · y el 3992? · repago BARRERA NESTOR OSCAR · frescura 30789")
+prompt = st.chat_input("Escribí tu consulta...")
 
 if prompt:
     st.session_state.messages.append({"role":"user","content":prompt})

@@ -5,7 +5,8 @@ import unicodedata
 from collections import Counter
 from typing import Any
 
-from sources import repago_source, frescura_source, grupos_source, planificacion_source
+from sources import repago_source, frescura_source, grupos_source
+from analyst_engine import analyze_question, should_analyze
 
 
 def normalize(text):
@@ -72,7 +73,6 @@ def scope_label(scope):
 
 
 STOPWORDS = {
-    "lleva", "llevan", "llevamos", "comprado", "comprados", "compro", "compraron", "comprando", "dia", "hoy", "fecha", "saldo", "restante", "restantes", "disponible", "disponibles", "consumido", "consumidos", "acumulado", "acumulados",
     "repago", "repaga", "repagan", "repagando", "cliente", "clientes", "del", "de", "la", "el", "los", "las",
     "como", "esta", "estado", "cuantas", "cuantos", "cuanta", "cuanto", "cantidad", "tiene", "tienen", "hay",
     "heladera", "heladeras", "edf", "equipo", "equipos", "que", "cual", "cuales", "descuento", "descuentos",
@@ -117,6 +117,9 @@ def _copy_context(context: dict[str, Any] | None) -> dict[str, Any]:
         "last_tope_segment": None,
         "pending_stock_scope": False,
         "pending_stock_sku": None,
+        "analyst_last_question": None,
+        "analyst_last_sql": None,
+        "analyst_last_assumption": None,
     }
     if context:
         base.update(context)
@@ -431,10 +434,7 @@ def _valid_followup_entity(raw: str, ctx: dict[str, Any]) -> bool:
             return True
         return len(repago_source.search_customers(query, limit=2)) > 0
 
-    if topic == "tope":
-        return bool(planificacion_source.customer(query) or planificacion_source.search_customers(query))
-
-    if topic == "discount":
+    if topic in {"discount", "tope"}:
         if query.isdigit() and (grupos_source.customer(query) or repago_source.customer(query)):
             return True
         return (
@@ -601,8 +601,6 @@ def _discount_answer(raw, ctx, requested_segment=None):
 
 def _tope_segment(text: str):
     t = normalize(text)
-    if "core" in t and "value" in t:
-        return None
     if "core" in t:
         return "CORE"
     if "value" in t:
@@ -611,55 +609,36 @@ def _tope_segment(text: str):
 
 
 def _tope_answer(raw, ctx, requested_segment=None):
-    if not planificacion_source.status().get("available"):
-        return "Los topes de Planificación todavía no están disponibles. Las otras consultas siguen habilitadas.", ["Planificación · topes"]
-    query = entity_query(raw)
-    cust = planificacion_source.customer(query or ctx.get("active_client_id", ""))
-    if not cust and query and not query.isdigit():
-        matches = planificacion_source.search_customers(query)
-        if not matches:
-            matches = [planificacion_source.customer(c["id"]) for c in repago_source.search_customers(query)]
-            matches = [c for c in matches if c]
-        if len(matches) > 1:
-            return _candidate_lines(matches, "Planificación"), []
-        cust = matches[0] if matches else None
-    if not cust:
-        return "No encontré ese cliente en el maestro de Planificación. Indicame su código o nombre.", []
+    if grupos_source.status().get("ok") is not True:
+        return "La fuente de **topes Core/Value** se está actualizando. Probá de nuevo en unos segundos.", ["Planificacion · topes"]
+
+    cust, err = _resolve_group_customer(raw, ctx)
+    if err:
+        return err, ["Planificacion · topes Core/Value"]
     _set_client_context(ctx, cust)
-    rows = planificacion_source.topes(cust["id"], requested_segment)
+    code = cust["id"]
+    name = cust.get("name") or cust.get("legal_name") or ""
+
+    segment = requested_segment or _tope_segment(raw)
+    rows = grupos_source.topes(code, segment)
     if not rows:
-        return f"El cliente **{cust['id']} — {cust.get('name', '')}** no tiene un tope Core/Value definido para su canal en Planificación.", ["Planificación · topes"]
-    lines = [f"**Cliente {cust['id']} — {cust.get('name', '')}** · canal {cust['canal']}", ""]
-    for row in rows:
-        label = row["segmento"]
-        if not row["extensions_verified"]:
-            lines.append(f"- **{label}: {number(row['base'], 0)} bultos de tope base.** Ampliaciones sin verificar.")
-        elif row["second"]:
-            lines.append(f"- **{label}: {number(row['total'], 0)} bultos autorizados**: primer tramo {number(row['base'], 0)} + segundo tramo {number(row['second'], 0)}, habilitado el {date_arg(row['date'])}.")
-        else:
-            lines.append(f"- **{label}: {number(row['base'], 0)} bultos**. Sin segundo tramo activo.")
-        purchases = row.get("purchases")
-        if purchases:
-            lines.append(f"  Comprados: **{number(purchases['bought'], 2)} bultos netos**.")
-            remaining = purchases['base_remaining']
-            if row['second'] and row['extensions_verified']:
-                lines.append(f"  Comprados desde la ampliación: **{number(purchases['second_bought'], 2)} bultos**.")
-                remaining = purchases['second_remaining']
-                balance_label = 'del segundo tramo'
-            else:
-                balance_label = 'del tope base' if not row['extensions_verified'] else 'del tope'
-            if remaining >= 0:
-                lines.append(f"  Restan {balance_label}: **{number(remaining, 2)} bultos**.")
-            else:
-                lines.append(f"  Excedido {balance_label} en **{number(-remaining, 2)} bultos**.")
-        else:
-            lines.append("  Comprados y saldo: **sin datos verificados para el mes actual**.")
-    period = next((r['purchases'] for r in rows if r.get('purchases')), None)
-    if period:
-        lines += ["", f"Ventas del **{date_arg(period['period_start'])} al {date_arg(period['cutoff'])}**, último día cargado hasta hoy. Incluye devoluciones/notas de crédito con su signo."]
-        if period['future_excluded']:
-            lines.append("Se excluyeron registros con fecha posterior a hoy.")
-    return "\n".join(lines), ["Planificación · topes Core/Value"]
+        target = f" **{segment}**" if segment else ""
+        return f"No pude determinar el tope{target} del **cliente {code} — {name}** con la información actual.", ["Planificacion · topes Core/Value"]
+
+    if segment and len(rows) == 1:
+        r = rows[0]
+        return (
+            f"**Cliente {code} — {name}** · Tope **{segment}: {number(r.get('tope_bultos'), 0)} bultos** "
+            f"(canal {r.get('canal') or '—'})."
+        ), ["Planificacion · Control bultos Core/Value"]
+
+    lines = [f"**Cliente {code} — {name}**", ""]
+    for r in rows:
+        lines.append(
+            f"- Tope **{r.get('segmento')}: {number(r.get('tope_bultos'), 0)} bultos** "
+            f"(canal {r.get('canal') or '—'})."
+        )
+    return "\n".join(lines), ["Planificacion · Control bultos Core/Value"]
 
 
 def _stock_answer(product, scope):
@@ -692,11 +671,8 @@ def _ask_stock_scope(product, ctx):
 def _resolve_frescura_product(raw: str, ctx: dict[str, Any]):
     text = normalize(raw)
     code = extract_code(text)
-    if code:
-        product = frescura_source.product(code)
-        if product:
-            return product, None
-        return None, f"No encontré el SKU **{code}** en el snapshot de Frescura."
+    if code and frescura_source.product(code):
+        return frescura_source.product(code), None
 
     query = entity_query(raw)
     if query and not query.isdigit():
@@ -709,8 +685,6 @@ def _resolve_frescura_product(raw: str, ctx: dict[str, Any]):
                 lines.append(f"- **{p.get('codigo')}** · {p.get('descripcion','')}")
             return None, "\n".join(lines)
 
-    if query:
-        return None, f"No encontré un producto que coincida con **{query}**."
     active = ctx.get("active_sku")
     if active:
         product = frescura_source.product(active)
@@ -848,7 +822,23 @@ def _topic_followup(raw: str, text: str, ctx: dict[str, Any], scope: str):
     return None
 
 
-def _respond(message: str, context: dict[str, Any] | None = None):
+def _analyst_answer(raw: str, ctx: dict[str, Any]):
+    result = analyze_question(raw, ctx)
+    if not result.handled:
+        return None
+    meta = result.meta or {}
+    plan = meta.get("plan") or {}
+    ctx["analyst_last_question"] = raw
+    if meta.get("sql"):
+        ctx["analyst_last_sql"] = meta.get("sql")
+    if plan.get("assumption"):
+        ctx["analyst_last_assumption"] = plan.get("assumption")
+    ctx["active_topic"] = "analyst"
+    ctx["last_intent"] = "analyst"
+    return result.answer, result.sources, ctx
+
+
+def respond(message: str, context: dict[str, Any] | None = None):
     """Responde manteniendo por separado entidad, tema y período."""
     ctx = _copy_context(context)
     raw = str(message or "").strip()
@@ -860,9 +850,16 @@ def _respond(message: str, context: dict[str, Any] | None = None):
         return (
             "Puedo responder **EDF/heladeras**, **ubicación por número de serie**, **Repago por trimestre o último mes**, "
             "**ventas mensuales**, **stock/Frescura**, **descuentos** y **topes de bultos Core/Value**. "
-            "Si una pregunta no es clara, te voy a pedir precisión en vez de adivinar.",
+            "Además puedo analizar comparaciones, rankings y cruces entre fuentes sin necesidad de que exista una frase programada exactamente.",
             [], ctx,
         )
+
+    # Preguntas comparativas, de ranking, conjuntos o cruces de fuentes pasan
+    # primero por el Analista DDV. Las consultas simples mantienen el camino rápido.
+    if should_analyze(raw):
+        analyst_result = _analyst_answer(raw, ctx)
+        if analyst_result is not None:
+            return analyst_result
 
     explicit_scope = scope_from(text)
     scope = explicit_scope or ctx.get("active_scope") or "DDV"
@@ -877,20 +874,8 @@ def _respond(message: str, context: dict[str, Any] | None = None):
         and not repago_words
     )
 
-    purchase_followup = any(k in text for k in ("compr", "lleva", "saldo", "resta", "queda", "consum", "acumul"))
-    if not repago_words and not any(k in text for k in ("hectolit", " hl")) and purchase_followup and (
-        "tope" in text or "bulto" in text or "core" in text or "value" in text or ctx.get("active_topic") == "tope"
-    ):
-        segment = _tope_segment(text)
-        if segment is None and not ("core" in text and "value" in text):
-            segment = ctx.get("last_tope_segment") if ctx.get("active_topic") == "tope" else None
-        answer, sources = _tope_answer(raw, ctx, segment)
-        ctx.update(active_topic="tope", last_tope_segment=segment, last_intent="tope")
-        return answer, sources, ctx
-
     # 0) Respuesta a la repregunta de localidad para stock.
-    scope_only = bool(explicit_scope) and not entity_query(raw) and not any(k in text for k in ("frescura", "riesgo", "venc", "lote", "repago", "tope", "descuento", "stock", "compra", "venta"))
-    if ctx.get("pending_stock_scope") and scope_only and not code:
+    if ctx.get("pending_stock_scope") and explicit_scope and not code:
         sku = str(ctx.get("pending_stock_sku") or ctx.get("active_sku") or "")
         product = frescura_source.product(sku) if sku else None
         if product:
@@ -910,8 +895,7 @@ def _respond(message: str, context: dict[str, Any] | None = None):
     serial_candidate = _serial_from_query(raw)
     location_words = any(k in text for k in ("donde", "ubicacion", "ubicado", "ubicada", "colocado", "colocada"))
     serial_words = any(k in text for k in ("serie", "serial", "numero de serie", "nro serie", "nro de serie"))
-    other_topic = monthly_sales_words or repago_words or any(k in text for k in ("stock", "frescura", "riesgo", "venc", "tope", "core", "value", "descuento"))
-    serial_followup = ctx.get("active_topic") == "edf_location" and bool(serial_candidate) and not other_topic
+    serial_followup = ctx.get("active_topic") == "edf_location" and bool(serial_candidate)
     serial_intent = serial_words or (location_words and asset_words and bool(serial_candidate)) or serial_followup
     if serial_intent:
         answer, sources = _edf_location_answer(raw, ctx)
@@ -920,8 +904,7 @@ def _respond(message: str, context: dict[str, Any] | None = None):
 
     # 2) Cambio de período dentro de un hilo de Repago.
     period_change = any(k in text for k in ("ultimo mes", "mes corriente", "mes actual", "este mes", "trimestre", "promedio"))
-    new_non_repago_topic = monthly_sales_words or any(k in text for k in ("stock", "frescura", "riesgo", "venc", "tope", "core", "value", "descuento"))
-    if period_change and not new_non_repago_topic and ctx.get("active_topic") in {"repago", "repago_count"} and ctx.get("active_client_id"):
+    if period_change and ctx.get("active_topic") in {"repago", "repago_count"} and ctx.get("active_client_id"):
         mode = _repago_mode_from_text(raw, ctx.get("last_repago_mode") or "trimestre")
         if ctx.get("active_topic") == "repago_count":
             answer, sources = _repago_count_answer(
@@ -971,11 +954,11 @@ def _respond(message: str, context: dict[str, Any] | None = None):
     tope_intent = (
         "tope" in text
         or ("bulto" in text and any(k in text for k in ("core", "value")))
-        or (ctx.get("active_topic") == "tope" and any(k in text for k in ("core", "value")) and "descuento" not in text)
+        or (ctx.get("active_topic") == "tope" and _tope_segment(text) is not None and "descuento" not in text)
     )
     if tope_intent:
         segment = _tope_segment(text)
-        if segment is None and ctx.get("active_topic") == "tope" and not ("core" in text and "value" in text):
+        if segment is None and ctx.get("active_topic") == "tope":
             segment = ctx.get("last_tope_segment")
         answer, sources = _tope_answer(raw, ctx, segment)
         ctx.update({
@@ -1020,7 +1003,7 @@ def _respond(message: str, context: dict[str, Any] | None = None):
         return answer, sources, ctx
 
     # Si veníamos hablando de stock y sólo cambia la localidad, mantenemos el SKU y respondemos stock.
-    if ctx.get("active_topic") == "stock" and scope_only and ctx.get("active_sku"):
+    if ctx.get("active_topic") == "stock" and explicit_scope and ctx.get("active_sku"):
         product = frescura_source.product(str(ctx.get("active_sku")))
         if product:
             _set_sku_context(ctx, product, explicit_scope)
@@ -1092,11 +1075,15 @@ def _respond(message: str, context: dict[str, Any] | None = None):
                 [], ctx,
             )
 
+    # Fallback universal: si ninguna regla rápida entendió la frase, el Analista DDV
+    # intenta derivar la respuesta desde los datos disponibles.
+    analyst_result = _analyst_answer(raw, ctx)
+    if analyst_result is not None:
+        return analyst_result
+
     return (
-        "**No entendí qué querés consultar.** No voy a asumir una respuesta. "
-        "Podés preguntarme, por ejemplo: `cuántas heladeras tiene CLIENTE`, `repago CLIENTE`, "
-        "`repago CLIENTE último mes`, `dónde está el EDF 565964`, `tope CORE de CLIENTE`, "
-        "`descuento CORE de CLIENTE`, `stock SKU` o `frescura SKU`.",
+        "**No pude traducir esa pregunta a un cálculo seguro con las fuentes actuales.** "
+        "Puedo analizar stock/Frescura, EDF/repago, ventas en HL, descuentos y topes; si me das un poco más de contexto la reformulo.",
         [], ctx,
     )
 
@@ -1106,7 +1093,6 @@ def refresh_all():
         ("Repagos / EDF", repago_source.refresh),
         ("Frescura", frescura_source.refresh),
         ("Grupo de clientes", grupos_source.refresh),
-        ("Topes Planificación", planificacion_source.refresh),
     ):
         try:
             fn(force=True)
@@ -1117,29 +1103,4 @@ def refresh_all():
 
 
 def statuses():
-    return [repago_source.status(), frescura_source.status(), grupos_source.status(), planificacion_source.status()]
-
-
-def respond(message: str, context: dict[str, Any] | None = None):
-    answer, sources, ctx = _respond(message, context)
-    health = []
-    for label in sources:
-        if "Planificación" in label or "Planificacion" in label:
-            module = planificacion_source
-        elif "Grupo de clientes" in label:
-            module = grupos_source
-        elif "Frescura" in label:
-            module = frescura_source
-        else:
-            module = repago_source
-        status = module.status()
-        dated = label
-        if status.get("data_as_of"):
-            dated += f" · datos/copia al {status['data_as_of']}"
-        health.append(dated)
-        warning = (status.get("warning") or "").replace(
-            "Falló la actualización; se conserva la última copia disponible.", ""
-        ).strip()
-        if warning and warning not in answer:
-            answer += "\n\n⚠️ " + warning
-    return answer, health, ctx
+    return [repago_source.status(), frescura_source.status(), grupos_source.status()]
