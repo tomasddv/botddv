@@ -463,7 +463,8 @@ def should_analyze(question: str) -> bool:
         and ("mes" in q or bool(_extract_freshness_months(q)))
         and any(k in q for k in ("producto", "productos", "sku", "venc", "frescura"))
     )
-    return current_sales or plural_or_set or comparative or aggregate or cross_source or correction_followup or zero_repago or purchase_date or purchase_contents or purchase_amount or freshness_month_list
+    promoter_analytics = "promotor" in q or "promotores" in q or bool(_requested_promoters(q))
+    return current_sales or plural_or_set or comparative or aggregate or cross_source or correction_followup or zero_repago or purchase_date or purchase_contents or purchase_amount or freshness_month_list or promoter_analytics
 
 
 def _extract_limit(q: str, default: int = 15) -> int:
@@ -1247,7 +1248,10 @@ def _metric(q: str, alias: str = "v") -> tuple[str, str, str]:
 
 
 def _group_entity(q: str) -> str | None:
-    if any(k in q for k in ("vendedor", "vendedores", "promotor", "promotores")):
+    # Promotor no es vendedor: vive en Grupo de clientes y se resuelve en
+    # _promoter_analytics_plan. Mantener ambos conceptos separados evita que
+    # una consulta por promotor termine agrupando por vendedor CHESS.
+    if any(k in q for k in ("vendedor", "vendedores")):
         return "vendedor"
     if "supervisor" in q or "supervisores" in q:
         return "supervisor"
@@ -1613,6 +1617,399 @@ def _sales_discount_cross_plan(q: str, context: dict[str, Any] | None = None) ->
         "action":"query", "title":"Descuento comercial vs venta del mes", "sql":sql,
         "assumption": _sales_period_note() + (f" Venta filtrada al foco {seg}." if seg else ""),
         "clarifying_question":"", "reason":"",
+    }
+
+
+
+
+def _promoter_values() -> list[str]:
+    """Lista de promotores del snapshot de Grupo de clientes."""
+    snap = _safe_snap(grupos_source)
+    values: dict[str, str] = {}
+    for rows in (snap.get("rows_by_customer") or {}).values():
+        for row in rows or []:
+            raw = str(row.get("promotor") or "").strip()
+            key = _norm(raw)
+            if raw and key:
+                values.setdefault(key, raw)
+    return sorted(values.values(), key=lambda x: _norm(x))
+
+
+def _requested_promoters(q: str) -> list[str]:
+    """Reconoce uno o varios nombres reales de promotor mencionados en la frase."""
+    qn = _norm(q)
+    found: list[str] = []
+    for raw in sorted(_promoter_values(), key=lambda x: (-len(_norm(x)), _norm(x))):
+        nv = _norm(raw)
+        if len(nv) < 3:
+            continue
+        if re.search(rf"(^|\b){re.escape(nv)}(\b|$)", qn):
+            found.append(raw)
+    return found
+
+
+def _promoter_mapping_cte(q: str) -> tuple[str, list[str]]:
+    """CTE de asignación cliente↔promotor, deduplicada por cliente/promotor."""
+    requested = _requested_promoters(q)
+    conditions = ["TRIM(COALESCE(promotor,''))<>''"]
+    if requested:
+        values = ",".join(_sql_text(x.upper()) for x in requested)
+        conditions.append(f"UPPER(promotor) IN ({values})")
+    where = " AND ".join(conditions)
+    cte = f"""
+        pm AS (
+            SELECT cliente_codigo, MAX(cliente) AS cliente, promotor
+            FROM descuentos_cliente
+            WHERE {where}
+            GROUP BY cliente_codigo, promotor
+        )
+    """
+    return cte, requested
+
+
+def _promoter_sales_where(q: str, context: dict[str, Any] | None = None, alias: str = "v", group_business: bool = False) -> tuple[str, list[str]]:
+    """Filtros de venta compatibles con analítica por promotor.
+
+    No interpreta la palabra promotor como vendedor. Cuando se agrupa por unidad de
+    negocio, evita aplicar un filtro genérico derivado de la propia dimensión, pero sí
+    respeta negocios concretos nombrados (CZA, Aguas, Marketplace, Red Bull, etc.).
+    """
+    p = alias + "." if alias else ""
+    filters: list[str] = []
+    notes: list[str] = []
+
+    loc = _location(q)
+    if loc in {"TRELEW", "MADRYN"}:
+        filters.append(f"UPPER({p}localidad_base)={_sql_text(loc)}")
+        notes.append(loc.title())
+
+    cust = _match_sales_customer(q, context)
+    if cust:
+        filters.append(f"{p}cliente_codigo={_sql_text(cust[0])}")
+        notes.append(f"cliente {cust[0]} · {cust[1]}")
+
+    sku = _match_sales_sku(q, context)
+    if sku:
+        filters.append(f"{p}sku={_sql_text(sku[0])}")
+        notes.append(f"SKU {sku[0]} · {sku[1]}")
+
+    # Focos comerciales explícitos (CORE, VALUE, CZA, etc.).
+    focus_cond, focus_label = _sales_focus_condition(q, alias)
+    if focus_cond:
+        filters.append(focus_cond)
+        notes.append(focus_label)
+
+    # Negocios concretos nombrados. Si sólo dice "por unidad de negocio", no filtra.
+    units = _requested_business_units(q, alias)
+    if units:
+        filters.append("(" + " OR ".join(cond for _, cond in units) + ")")
+        notes.append("negocios: " + ", ".join(label for label, _ in units))
+
+    time_cond, time_label = _sales_time_condition(q, alias)
+    if time_cond:
+        filters.append(time_cond)
+        notes.append(time_label)
+
+    return ("WHERE " + " AND ".join(filters)) if filters else "", notes
+
+
+def _promoter_repago_threshold(q: str) -> tuple[str, str]:
+    """HAVING para consultas de repago por promotor."""
+    low = _threshold_after(("menos del", "menos de", "menor a", "debajo de"), q)
+    high = _threshold_after(("mas del", "más del", "mas de", "más de", "mayor a", "arriba de"), q)
+    if low is not None:
+        return f"HAVING AVG(repago_pct) < {low}", f"repago < {low:g}%"
+    if high is not None:
+        return f"HAVING AVG(repago_pct) > {high}", f"repago > {high:g}%"
+    return "", ""
+
+
+def _promoter_analytics_plan(q: str, context: dict[str, Any] | None = None) -> dict | None:
+    """Cálculos cruzados por promotor con venta CHESS, SKU/segmento/negocio y Repago.
+
+    Casos cubiertos, entre otros:
+      - clientes con compra de cada promotor
+      - clientes con compra por promotor y SKU / segmento
+      - venta $ y HL por promotor y unidad de negocio
+      - venta y repago por promotor
+      - repago por promotor / promotor y negocio
+    """
+    qn = _norm(q)
+    requested_promoters = _requested_promoters(qn)
+    if "promotor" not in qn and "promotores" not in qn and not requested_promoters:
+        return None
+
+    pm_cte, requested_promoters = _promoter_mapping_cte(qn)
+    promoter_note = ("Promotor: " + ", ".join(requested_promoters) + ". ") if requested_promoters else ""
+    period_note = _sales_period_note()
+    limit = max(_extract_limit(qn, default=40), 40)
+
+    wants_repago = any(k in qn for k in ("repago", "edf", "heladera", "heladeras", "equipo", "equipos"))
+    wants_sales = any(k in qn for k in (
+        "venta", "ventas", "vend", "compra", "compr", "cliente", "clientes",
+        "hl", "hectolit", "importe", "pesos", "monto", "dinero", "$", "sku",
+        "producto", "segmento", "unidad de negocio", "negocio"
+    ))
+
+    by_sku = bool(re.search(r"\bpor\s+(?:sku|producto)s?\b", qn)) or (
+        "promotor" in qn and any(k in qn for k in ("cada sku", "por sku", "por producto", "promotor y sku", "promotores y sku"))
+    )
+    by_segment = bool(re.search(r"\bpor\s+segmento\b", qn)) or any(k in qn for k in ("cada segmento", "promotor y segmento", "promotores y segmento"))
+    by_business = (
+        "por unidad de negocio" in qn or "por unidades de negocio" in qn
+        or "cada unidad de negocio" in qn or "por negocio" in qn
+        or "promotor y unidad de negocio" in qn or "promotores y unidad de negocio" in qn
+    )
+    by_client = bool(re.search(r"\bpor\s+cliente\b", qn)) or any(k in qn for k in (
+        "detalle de clientes", "listame los clientes", "lista de clientes", "que clientes", "cuales clientes"
+    ))
+
+    asks_count = any(k in qn for k in ("cuantos clientes", "cuántos clientes", "cantidad de clientes", "clientes con compra"))
+    wants_hl, wants_money, wants_invoices = _requested_sales_metrics(qn)
+    # En analítica por promotor, si no pide una métrica concreta mostramos HL y $ por defecto.
+    if wants_sales and not any((wants_hl, wants_money, wants_invoices)):
+        wants_hl = True
+        wants_money = True
+
+    rep_field = _repago_field(qn)
+    rep_label = "último mes disponible" if rep_field == "repago_ultimo_mes_pct" else "trimestre"
+
+    # ---------------- Repago puro por promotor ----------------
+    if wants_repago and not any(k in qn for k in ("venta", "ventas", "vend", "compra", "compr", "hl", "importe", "pesos", "$", "sku", "segmento")):
+        rep_business = by_business or ("negocio" in qn and "repago" in qn)
+        group_cols = "pm.promotor, r.negocio" if rep_business else "pm.promotor"
+        select_business = ", r.negocio AS negocio" if rep_business else ""
+        order_business = ", negocio" if rep_business else ""
+        having, threshold_note = _promoter_repago_threshold(qn)
+        sql = f"""
+            WITH {pm_cte.strip()},
+            base AS (
+                SELECT pm.promotor{select_business}, r.cliente_codigo, r.{rep_field} AS repago_pct,
+                       r.objetivo_hl
+                FROM pm
+                JOIN repago_edf r ON r.cliente_codigo=pm.cliente_codigo
+                WHERE UPPER(r.estado)='PDV'
+            )
+            SELECT promotor{', negocio' if rep_business else ''},
+                   COUNT(DISTINCT cliente_codigo) AS clientes_con_edf,
+                   COUNT(*) AS cantidad_edf,
+                   ROUND(AVG(repago_pct),1) AS repago_promedio_pct,
+                   ROUND(SUM(objetivo_hl),2) AS objetivo_hl
+            FROM base
+            GROUP BY {group_cols.replace('pm.','').replace('r.','')}
+            {having}
+            ORDER BY repago_promedio_pct ASC, cantidad_edf DESC{order_business}
+            LIMIT {limit}
+        """
+        title = "Repago por promotor" + (" y negocio" if rep_business else "")
+        assumption = promoter_note + f"Repago calculado sobre EDF en estado PDV; período: {rep_label}."
+        if threshold_note:
+            assumption += f" Filtro: {threshold_note}."
+        return {
+            "action":"query", "title":title, "sql":sql, "assumption":assumption,
+            "clarifying_question":"", "reason":"", "intent":"promotor_repago",
+        }
+
+    # ---------------- Venta CHESS por promotor y dimensiones ----------------
+    if wants_sales:
+        sales_where, sales_notes = _promoter_sales_where(qn, context, "v", group_business=by_business)
+        # Para contar compra, nos quedamos con movimiento neto positivo a nivel fila.
+        positive = "(COALESCE(v.hl,0)>0 OR COALESCE(v.importe_neto,0)>0)"
+        sales_where_positive = sales_where + (" AND " if sales_where else "WHERE ") + positive
+
+        no_purchase = any(k in qn for k in (
+            "sin compra", "sin compras", "sin venta", "sin ventas", "venta 0", "venta cero",
+            "no compro", "no compraron", "no compra", "no vendio", "no vendieron"
+        ))
+        activation = any(k in qn for k in (
+            "activacion", "activación", "cobertura de clientes", "porcentaje de clientes con compra",
+            "% de clientes con compra", "clientes activos"
+        ))
+
+        # Clientes asignados sin compra (o nivel de activación) por promotor.
+        # Se arma desde el universo de Grupo de clientes y se hace LEFT JOIN contra
+        # la venta filtrada, por lo que también puede responder venta 0 para un SKU,
+        # segmento, localidad o negocio específico.
+        if no_purchase or activation:
+            sql = f"""
+                WITH {pm_cte.strip()},
+                sc AS (
+                    SELECT v.cliente_codigo,
+                           SUM(v.hl) AS hl,
+                           SUM(v.importe_neto) AS importe_neto
+                    FROM ventas_mes_actual v
+                    {sales_where}
+                    GROUP BY v.cliente_codigo
+                )
+                SELECT pm.promotor,
+                       COUNT(DISTINCT pm.cliente_codigo) AS clientes_asignados,
+                       COUNT(DISTINCT CASE WHEN COALESCE(sc.hl,0)>0 OR COALESCE(sc.importe_neto,0)>0 THEN pm.cliente_codigo END) AS clientes_con_compra,
+                       COUNT(DISTINCT CASE WHEN COALESCE(sc.hl,0)<=0 AND COALESCE(sc.importe_neto,0)<=0 THEN pm.cliente_codigo END) AS clientes_sin_compra,
+                       ROUND(100.0 * COUNT(DISTINCT CASE WHEN COALESCE(sc.hl,0)>0 OR COALESCE(sc.importe_neto,0)>0 THEN pm.cliente_codigo END)
+                             / NULLIF(COUNT(DISTINCT pm.cliente_codigo),0),1) AS activacion_pct
+                FROM pm
+                LEFT JOIN sc ON sc.cliente_codigo=pm.cliente_codigo
+                GROUP BY pm.promotor
+                ORDER BY {'clientes_sin_compra DESC' if no_purchase else 'activacion_pct DESC'}, pm.promotor
+                LIMIT {limit}
+            """
+            title = "Clientes sin compra por promotor" if no_purchase else "Activación de clientes por promotor"
+            return {
+                "action":"query", "title":title, "sql":sql,
+                "assumption":promoter_note + period_note + (" Filtros: " + ", ".join(sales_notes) + "." if sales_notes else ""),
+                "clarifying_question":"", "reason":"", "intent":"promotor_activacion",
+            }
+
+        # Detalle por cliente si se pide expresamente quiénes son.
+        if by_client and not by_sku and not by_segment and not by_business:
+            sql = f"""
+                WITH {pm_cte.strip()}
+                SELECT pm.promotor,
+                       v.cliente_codigo,
+                       MAX(COALESCE(NULLIF(v.nombre_fantasia,''),v.cliente)) AS cliente,
+                       ROUND(SUM(v.hl),2) AS hl,
+                       ROUND(SUM(v.importe_neto),2) AS importe_neto,
+                       ROUND(SUM(v.facturas),0) AS facturas,
+                       MAX(DATE(v.fecha)) AS ultima_compra
+                FROM pm
+                JOIN ventas_mes_actual v ON v.cliente_codigo=pm.cliente_codigo
+                {sales_where_positive}
+                GROUP BY pm.promotor, v.cliente_codigo
+                ORDER BY pm.promotor, hl DESC, importe_neto DESC
+                LIMIT {MAX_RESULT_ROWS}
+            """
+            return {
+                "action":"query", "title":"Clientes con compra por promotor", "sql":sql,
+                "assumption":promoter_note + period_note + (" Filtros: " + ", ".join(sales_notes) + "." if sales_notes else ""),
+                "clarifying_question":"", "reason":"", "intent":"promotor_clientes",
+                "display_all": "todos" in qn,
+            }
+
+        # Dimensión secundaria solicitada.
+        if by_sku:
+            dim_select = ", v.sku, MAX(v.producto) AS producto"
+            dim_group = ", v.sku"
+            dim_order = ", v.sku"
+            dim_label = " y SKU"
+        elif by_segment:
+            dim_select = ", COALESCE(NULLIF(v.segmento,''),'SIN SEGMENTO') AS segmento"
+            dim_group = ", COALESCE(NULLIF(v.segmento,''),'SIN SEGMENTO')"
+            dim_order = ", segmento"
+            dim_label = " y segmento"
+        elif by_business:
+            dim_select = ", COALESCE(NULLIF(v.unidad_negocio,''),'SIN UNIDAD') AS unidad_negocio"
+            dim_group = ", COALESCE(NULLIF(v.unidad_negocio,''),'SIN UNIDAD')"
+            dim_order = ", unidad_negocio"
+            dim_label = " y unidad de negocio"
+        else:
+            dim_select = ""
+            dim_group = ""
+            dim_order = ""
+            dim_label = ""
+
+        metric_cols: list[str] = []
+        if asks_count or "cliente" in qn or (wants_repago and not any((by_sku, by_segment, by_business))):
+            metric_cols.append("COUNT(DISTINCT v.cliente_codigo) AS clientes_con_compra")
+        if wants_hl:
+            metric_cols.append("ROUND(SUM(v.hl),2) AS hl")
+        if wants_money:
+            metric_cols.append("ROUND(SUM(v.importe_neto),2) AS importe_neto")
+        if wants_invoices:
+            metric_cols.append("ROUND(SUM(v.facturas),0) AS facturas")
+        if not metric_cols:
+            metric_cols = ["COUNT(DISTINCT v.cliente_codigo) AS clientes_con_compra", "ROUND(SUM(v.hl),2) AS hl", "ROUND(SUM(v.importe_neto),2) AS importe_neto"]
+
+        metric_sql = ",\n                       ".join(metric_cols)
+        # Ordena por la métrica principal más útil.
+        if wants_money:
+            order_metric = "importe_neto DESC"
+        elif wants_hl:
+            order_metric = "hl DESC"
+        else:
+            order_metric = "clientes_con_compra DESC"
+
+        sales_sql = f"""
+            SELECT pm.promotor{dim_select},
+                   {metric_sql}
+            FROM pm
+            JOIN ventas_mes_actual v ON v.cliente_codigo=pm.cliente_codigo
+            {sales_where_positive}
+            GROUP BY pm.promotor{dim_group}
+        """
+
+        # Cruce venta + repago. El repago se resume por promotor y se agrega a cada
+        # fila de venta. Si hay una dimensión secundaria, el repago se repite como
+        # KPI del promotor para facilitar la comparación sin atribuirlo falsamente al SKU.
+        if wants_repago:
+            having, threshold_note = _promoter_repago_threshold(qn)
+            # El HAVING se aplica dentro del agregado de repago por promotor.
+            repago_having = having.replace("HAVING AVG(repago_pct)", f"HAVING AVG(r.{rep_field})") if having else ""
+            sql = f"""
+                WITH {pm_cte.strip()},
+                venta AS (
+                    {sales_sql}
+                ),
+                rep AS (
+                    SELECT pm.promotor,
+                           COUNT(DISTINCT r.cliente_codigo) AS clientes_con_edf,
+                           COUNT(*) AS cantidad_edf,
+                           ROUND(AVG(r.{rep_field}),1) AS repago_promedio_pct,
+                           ROUND(SUM(r.objetivo_hl),2) AS objetivo_hl
+                    FROM pm
+                    JOIN repago_edf r ON r.cliente_codigo=pm.cliente_codigo
+                    WHERE UPPER(r.estado)='PDV'
+                    GROUP BY pm.promotor
+                    {repago_having}
+                )
+                SELECT venta.*, rep.clientes_con_edf, rep.cantidad_edf,
+                       rep.repago_promedio_pct, rep.objetivo_hl
+                FROM venta
+                LEFT JOIN rep ON rep.promotor=venta.promotor
+                {'WHERE rep.promotor IS NOT NULL' if threshold_note else ''}
+                ORDER BY {order_metric}{dim_order}
+                LIMIT {MAX_RESULT_ROWS if dim_label else limit}
+            """
+            title = "Venta + repago por promotor" + dim_label
+            assumption = promoter_note + period_note + f" Repago: EDF en PDV, período {rep_label}; el KPI de repago es del promotor completo."
+            if threshold_note:
+                assumption += f" Filtro: {threshold_note}."
+        else:
+            sql = f"""
+                WITH {pm_cte.strip()}
+                {sales_sql}
+                ORDER BY {order_metric}{dim_order}
+                LIMIT {MAX_RESULT_ROWS if dim_label else limit}
+            """
+            if asks_count and not dim_label:
+                title = "Clientes con compra por promotor"
+            else:
+                title = "Venta por promotor" + dim_label
+            assumption = promoter_note + period_note
+
+        if sales_notes:
+            assumption += " Filtros: " + ", ".join(sales_notes) + "."
+        if by_sku or by_segment or by_business:
+            assumption += " Cada venta se atribuye al promotor asignado al código de cliente en Grupo de clientes."
+
+        return {
+            "action":"query", "title":title, "sql":sql, "assumption":assumption,
+            "clarifying_question":"", "reason":"", "intent":"promotor_venta_repago" if wants_repago else "promotor_venta",
+            "display_all": "todos" in qn,
+        }
+
+    # Si sólo menciona promotor sin una métrica reconocible, ofrecer un resumen útil.
+    sql = f"""
+        WITH {pm_cte.strip()}
+        SELECT promotor, COUNT(DISTINCT cliente_codigo) AS clientes_asignados
+        FROM pm
+        GROUP BY promotor
+        ORDER BY clientes_asignados DESC, promotor
+        LIMIT {limit}
+    """
+    return {
+        "action":"query", "title":"Clientes asignados por promotor", "sql":sql,
+        "assumption":promoter_note + "Asignación tomada del snapshot de Grupo de clientes.",
+        "clarifying_question":"", "reason":"", "intent":"promotor_clientes_asignados",
     }
 
 
@@ -2134,6 +2531,13 @@ def _local_plan(question: str, context: dict[str, Any] | None = None) -> dict:
     if plan:
         return plan
 
+    # Promotor vive en Grupo de clientes y puede cruzarse con Venta CHESS y Repago.
+    # Debe resolverse antes que el motor de venta genérico para no confundir
+    # "promotor" con vendedor ni intentar buscarlo como nombre de cliente.
+    plan = _promoter_analytics_plan(q, context)
+    if plan:
+        return plan
+
     # Repago + venta 0 es un cruce específico del snapshot de Repago y debe
     # resolverse antes que la venta CHESS del mes corriente. También se atienden
     # primero las repreguntas de corrección ("esos no tienen venta 0").
@@ -2165,7 +2569,7 @@ def _local_plan(question: str, context: dict[str, Any] | None = None) -> dict:
     return {
         "action":"unavailable", "title":"", "sql":"", "assumption":"",
         "clarifying_question":"",
-        "reason":"Puedo analizar libremente venta del mes corriente, stock/Frescura, EDF/repago, ventas históricas en HL, descuentos y topes, pero no pude traducir esta frase a un cálculo seguro con las columnas disponibles.",
+        "reason":"Puedo analizar libremente venta del mes corriente, promotores, stock/Frescura, EDF/repago, ventas históricas en HL, descuentos y topes, pero no pude traducir esta frase a un cálculo seguro con las columnas disponibles.",
     }
 
 
@@ -2272,6 +2676,15 @@ FRIENDLY = {
     "producto": "Producto",
     "vendedor": "Vendedor",
     "vendedor_codigo": "Código vendedor",
+    "promotor": "Promotor",
+    "clientes_con_compra": "Clientes con compra",
+    "clientes_sin_compra": "Clientes sin compra",
+    "activacion_pct": "Activación %",
+    "clientes_con_edf": "Clientes con EDF",
+    "clientes_asignados": "Clientes asignados",
+    "repago_promedio_pct": "Repago promedio %",
+    "objetivo_hl": "Objetivo HL",
+    "negocio": "Negocio",
     "supervisor": "Supervisor",
     "marca": "Marca",
     "division": "División",
