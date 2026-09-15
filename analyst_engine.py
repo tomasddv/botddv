@@ -622,25 +622,50 @@ def _sales_period_note() -> str:
     if start and end:
         def ar(v):
             try:
-                y, m, d = v[:10].split("-")
+                y, m, d = str(v)[:10].split("-")
                 return f"{d}/{m}/{y}"
             except Exception:
-                return v
-        return f"Venta CHESS del mes corriente, corte **{ar(start)} al {ar(end)}**."
+                return str(v or "")
+        try:
+            fresh = ventas_actual_source.freshness()
+        except Exception:
+            fresh = {}
+        note = f"Venta CHESS del mes corriente, corte **{ar(start)} al {ar(end)}**."
+        expected = str(fresh.get("expected_cutoff") or "")
+        if expected and not fresh.get("is_current", True):
+            note += (
+                f" La carga esperada del **{ar(expected)}** todavía no está disponible; "
+                "el bot la vuelve a buscar automáticamente cada pocos minutos."
+            )
+        return note
     return "Venta CHESS del mes corriente según el último snapshot disponible."
 
 
 def _is_current_sales_question(q: str) -> bool:
-    current = any(k in q for k in (
+    """Por defecto, una consulta de venta/compra sin período explícito usa el mes corriente.
+
+    Sólo se deriva al histórico cuando el usuario lo pide expresamente. Esto evita que
+    preguntas naturales como "cuántos clientes con compra hay de CZA" terminen en Repago/EDF.
+    """
+    explicit_history = any(k in q for k in (
+        "ultimo mes completo", "último mes completo", "mes pasado", "mes anterior",
+        "trimestre", "trimestral", "promedio mensual", "promedio de los ultimos",
+        "promedio de los últimos", "historico", "histórico", "periodo anterior",
+        "período anterior", "año pasado", "ano pasado",
+    ))
+    explicit_current = any(k in q for k in (
         "este mes", "mes actual", "mes corriente", "acumulado del mes", "acumulado mes",
         "venta diaria", "ventas diarias", "vendimos", "vendido", "vendida", "hoy", "ayer",
         "ultimos dias", "ultimos ", "últimos ",
     ))
     sales = any(k in q for k in (
         "venta", "ventas", "vende", "vend", "compra", "compr", "hl", "hectolit",
-        "factur", "cliente", "producto", "sku", "marca", "division", "negocio",
+        "factur", "importe", "monto", "dinero", "pesos", "$", "cliente", "clientes",
+        "producto", "productos", "sku", "marca", "division", "negocio",
     ))
-    return current and sales
+    if explicit_history:
+        return False
+    return explicit_current or sales
 
 
 def _sales_rows() -> list[dict]:
@@ -790,6 +815,77 @@ def _sales_time_condition(q: str, alias: str = "v") -> tuple[str, str]:
     return "", ""
 
 
+
+_GENERIC_SALES_STOPWORDS = {
+    "cuanta", "cuanto", "cuantas", "cuantos", "que", "cual", "cuales", "hay", "tiene", "tienen",
+    "venta", "ventas", "vende", "venden", "vendido", "vendida", "vendimos", "compra", "compras",
+    "compraron", "compradores", "cliente", "clientes", "producto", "productos", "sku", "marca",
+    "division", "divisiones", "negocio", "unidad", "importe", "monto", "dinero", "pesos",
+    "facturacion", "facturas", "hl", "hectolitros", "este", "mes", "actual", "corriente",
+    "de", "del", "la", "las", "el", "los", "en", "por", "para", "con", "sin", "un", "una",
+    "total", "acumulado", "mas", "menos", "mayor", "menor", "mucho", "poco", "top",
+    "trelew", "madryn", "puerto", "cza", "core", "value", "premium", "balanced", "nabs",
+}
+
+_GENERIC_DIMENSION_PRIORITY = (
+    ("unidad_negocio", "unidad de negocio"),
+    ("foco_comercial", "foco comercial"),
+    ("division", "división"),
+    ("marca_unificada", "marca"),
+    ("segmento", "segmento"),
+    ("segmento_2", "segmento 2"),
+    ("segmento_3", "segmento 3"),
+    ("subcanal", "subcanal"),
+    ("agrupacion", "agrupación"),
+    ("lista_precios", "lista de precios"),
+    ("supervisor", "supervisor"),
+)
+
+
+def _generic_sales_dimension_condition(q: str, alias: str = "v") -> tuple[str, str]:
+    """Reconoce valores comerciales aunque el usuario no nombre la dimensión.
+
+    Ej.: "cuánta venta en $ tiene marketplace" -> unidad_negocio contiene MARKETPLACE.
+    """
+    rows = _sales_rows()
+    if not rows:
+        return "", ""
+
+    tokens = [
+        t for t in re.findall(r"[a-z0-9]+", _norm(q))
+        if len(t) >= 4 and t not in _GENERIC_SALES_STOPWORDS and not t.isdigit()
+    ]
+    tokens = sorted(dict.fromkeys(tokens), key=lambda x: (-len(x), x))
+    if not tokens:
+        return "", ""
+
+    p = alias + "." if alias else ""
+    for field, label in _GENERIC_DIMENSION_PRIORITY:
+        values = {}
+        for row in rows:
+            raw = str(row.get(field) or "").strip()
+            if not raw:
+                continue
+            n = _norm(raw)
+            if n:
+                values[n] = raw
+        if not values:
+            continue
+
+        for token in tokens:
+            matched = [raw for n, raw in values.items() if re.search(rf"(^|\b){re.escape(token)}", n)]
+            if not matched:
+                continue
+            escaped = token.replace("'", "''").upper()
+            condition = f"UPPER({p}{field}) LIKE '%{escaped}%'"
+            sample = sorted(set(matched))[:3]
+            detail = ", ".join(sample)
+            if len(set(matched)) > 3:
+                detail += ", …"
+            return condition, f"{label}: {detail}"
+    return "", ""
+
+
 def _sales_filters(q: str, context: dict[str, Any] | None = None, alias: str = "v") -> tuple[list[str], list[str]]:
     p = alias + "." if alias else ""
     filters, notes = [], []
@@ -813,6 +909,10 @@ def _sales_filters(q: str, context: dict[str, Any] | None = None, alias: str = "
     if focus_cond:
         filters.append(focus_cond)
         notes.append(focus_label)
+    generic_cond, generic_label = _generic_sales_dimension_condition(q, alias)
+    if generic_cond:
+        filters.append(generic_cond)
+        notes.append(generic_label)
     time_cond, time_label = _sales_time_condition(q, alias)
     if time_cond:
         filters.append(time_cond)
@@ -1061,9 +1161,19 @@ def _current_sales_plan(q: str, context: dict[str, Any] | None = None) -> dict |
     direction = "ASC" if low else "DESC"
     period_note = _sales_period_note()
 
-    # Conteos simples.
+    # Conteos simples. "Clientes con compra" = clientes cuyo neto acumulado en el filtro es > 0.
     if any(k in q for k in ("cuantos clientes", "cuántos clientes", "cantidad de clientes")):
-        return {"action":"query", "title":"Clientes compradores del mes", "sql":f"SELECT COUNT(DISTINCT v.cliente_codigo) AS clientes FROM ventas_mes_actual v {where} AND v.hl<>0" if where else "SELECT COUNT(DISTINCT v.cliente_codigo) AS clientes FROM ventas_mes_actual v WHERE v.hl<>0", "assumption":period_note, "clarifying_question":"", "reason":""}
+        sql = f"""
+            SELECT COUNT(*) AS clientes
+            FROM (
+                SELECT v.cliente_codigo
+                FROM ventas_mes_actual v
+                {where}
+                GROUP BY v.cliente_codigo
+                HAVING SUM(v.hl) > 0
+            ) compradores
+        """
+        return {"action":"query", "title":"Clientes compradores del mes", "sql":sql, "assumption":period_note, "clarifying_question":"", "reason":""}
     if any(k in q for k in ("cuantos productos", "cuántos productos", "cuantos sku", "cuántos sku", "cantidad de sku")):
         return {"action":"query", "title":"SKU vendidos en el mes", "sql":f"SELECT COUNT(DISTINCT v.sku) AS productos FROM ventas_mes_actual v {where} AND v.hl<>0" if where else "SELECT COUNT(DISTINCT v.sku) AS productos FROM ventas_mes_actual v WHERE v.hl<>0", "assumption":period_note, "clarifying_question":"", "reason":""}
 
@@ -1124,16 +1234,32 @@ def _current_sales_plan(q: str, context: dict[str, Any] | None = None) -> dict |
         select="COALESCE(NULLIF(v.localidad_base,''),'SIN BASE') AS localidad_base"
         group="COALESCE(NULLIF(v.localidad_base,''),'SIN BASE')"
     else:
-        # Total del mes/filtro pedido.
-        sql=f"""
-            SELECT ROUND(SUM(v.hl),2) AS hl,
-                   ROUND(SUM(v.importe_neto),2) AS importe_neto,
-                   COUNT(DISTINCT v.cliente_codigo) AS clientes,
-                   COUNT(DISTINCT v.sku) AS productos
-            FROM ventas_mes_actual v
-            {where}
-        """
-        title="Venta acumulada del mes"
+        # Total del mes/filtro pedido. Si el usuario pide una métrica concreta ($/facturas),
+        # respondemos esa métrica en vez de mezclarla con información no solicitada.
+        if metric_alias == "importe_neto":
+            sql=f"""
+                SELECT ROUND(SUM(v.importe_neto),2) AS importe_neto
+                FROM ventas_mes_actual v
+                {where}
+            """
+            title="Venta en $ del mes"
+        elif metric_alias == "facturas":
+            sql=f"""
+                SELECT ROUND(SUM(v.facturas),0) AS facturas
+                FROM ventas_mes_actual v
+                {where}
+            """
+            title="Facturas del mes"
+        else:
+            sql=f"""
+                SELECT ROUND(SUM(v.hl),2) AS hl,
+                       ROUND(SUM(v.importe_neto),2) AS importe_neto,
+                       COUNT(DISTINCT v.cliente_codigo) AS clientes,
+                       COUNT(DISTINCT v.sku) AS productos
+                FROM ventas_mes_actual v
+                {where}
+            """
+            title="Venta acumulada del mes"
         if notes:
             title += " · " + " · ".join(notes)
         return {"action":"query", "title":title, "sql":sql, "assumption":period_note, "clarifying_question":"", "reason":""}

@@ -11,9 +11,12 @@ from sources import repago_source, frescura_source, grupos_source, planificacion
 
 _INTERVAL_MINUTES = max(5, int(os.getenv("AUTO_REFRESH_MINUTES", "30") or 30))
 _INTERVAL_SECONDS = _INTERVAL_MINUTES * 60
+_SALES_RETRY_MINUTES = max(5, int(os.getenv("SALES_REFRESH_MINUTES", "5") or 5))
+_SALES_RETRY_SECONDS = _SALES_RETRY_MINUTES * 60
 
 _lock = threading.RLock()
 _thread: threading.Thread | None = None
+_sales_thread: threading.Thread | None = None
 _stop_event = threading.Event()
 _initial_attempted = False
 _state: dict[str, Any] = {
@@ -85,14 +88,47 @@ def _worker() -> None:
             break
 
 
+def _sales_worker() -> None:
+    """Después de las 16, reintenta Venta diaria cada 5 min hasta tener el corte del día."""
+    if _stop_event.wait(8.0):
+        return
+    while not _stop_event.is_set():
+        try:
+            waiting = ventas_actual_source.needs_refresh()
+        except Exception:
+            waiting = True
+
+        if waiting:
+            try:
+                ventas_actual_source.refresh(force=True)
+                with _lock:
+                    current = dict(_state.get("results") or {})
+                    current["Venta mes actual"] = "OK"
+                    _state["results"] = current
+            except Exception as exc:
+                with _lock:
+                    current = dict(_state.get("results") or {})
+                    current["Venta mes actual"] = f"{type(exc).__name__}: {exc}"
+                    _state["results"] = current
+            wait_seconds = _SALES_RETRY_SECONDS
+        else:
+            # Ya está al día: no castigar Drive; el ciclo general sigue cada 30 min.
+            wait_seconds = _INTERVAL_SECONDS
+
+        if _stop_event.wait(wait_seconds):
+            break
+
+
 def start_background_updater() -> None:
-    global _thread
+    global _thread, _sales_thread
     with _lock:
-        if _thread is not None and _thread.is_alive():
-            return
         _stop_event.clear()
-        _thread = threading.Thread(target=_worker, name="ddv-auto-refresh", daemon=True)
-        _thread.start()
+        if _thread is None or not _thread.is_alive():
+            _thread = threading.Thread(target=_worker, name="ddv-auto-refresh", daemon=True)
+            _thread.start()
+        if _sales_thread is None or not _sales_thread.is_alive():
+            _sales_thread = threading.Thread(target=_sales_worker, name="ddv-sales-refresh", daemon=True)
+            _sales_thread.start()
 
 
 def force_refresh_async() -> bool:
@@ -107,4 +143,9 @@ def state() -> dict[str, Any]:
     with _lock:
         out = dict(_state)
     out["interval_minutes"] = _INTERVAL_MINUTES
+    out["sales_retry_minutes"] = _SALES_RETRY_MINUTES
+    try:
+        out["sales_freshness"] = ventas_actual_source.freshness()
+    except Exception:
+        out["sales_freshness"] = {}
     return out
