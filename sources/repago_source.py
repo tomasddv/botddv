@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from .health import describe, stamp
-
 from datetime import datetime
 from pathlib import Path
 import json
@@ -186,6 +184,7 @@ def _snapshot_from_db(db: dict) -> dict:
 
     customer_db: dict[str, dict] = {}
     customers: dict[str, dict] = {}
+    monthly_sales: list[dict] = []
     for c in db.get("customers", []):
         cid = _norm_code(c.get("id"))
         if not cid:
@@ -220,6 +219,19 @@ def _snapshot_from_db(db: dict) -> dict:
             "latest_by_business": latest_by_business,
             "repago_periods": repago_periods,
         }
+
+        for business in ("CZA", "UNG", "AGUAS", "RB", "OTROS"):
+            for period in available_periods:
+                value = _monthly_hl(c, business, period)
+                if abs(value) <= 1e-12:
+                    continue
+                monthly_sales.append({
+                    "cliente_codigo": cid,
+                    "cliente": customers[cid]["name"],
+                    "periodo": period,
+                    "negocio": business,
+                    "hl": round(value, 4),
+                })
 
     all_edfs: list[dict] = []
     raw_by_group: dict[tuple[str, str], list[dict]] = {}
@@ -264,8 +276,8 @@ def _snapshot_from_db(db: dict) -> dict:
     )
 
     return {
-        "schema_version": 3,
-        "updated_at": stamp(),
+        "schema_version": 4,
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "available_periods": available_periods,
         "repago_periods": repago_periods,
         "latest_period": latest_period,
@@ -275,6 +287,7 @@ def _snapshot_from_db(db: dict) -> dict:
         "rows_by_customer": rows_trim,
         "rows_by_customer_latest": rows_last,
         "all_edfs": all_edfs,
+        "monthly_sales": monthly_sales,
     }
 
 def _prepare_module():
@@ -294,11 +307,7 @@ def refresh(force=True):
     """Actualización pesada explícita. Las consultas nunca llaman a esta función."""
     global _last_error
     with _lock:
-        try:
-            module = _prepare_module()
-        except Exception as exc:
-            _last_error = exc
-            raise
+        module = _prepare_module()
         last_exc = None
         for attempt in range(2):
             try:
@@ -319,10 +328,27 @@ def refresh(force=True):
 
 def status():
     snap = _load_disk()
-    return describe('Repagos EDF', snap, _last_error,
-                    compatible=int((snap or {}).get("schema_version") or 0) >= 3,
-                    detail='EDF y repago trimestral/último mes')
-
+    if snap and int(snap.get("schema_version") or 0) >= 4:
+        return {
+            "ok": True,
+            "name": "Repagos EDF",
+            "detail": (
+                f"{len(snap.get('customers', {}))} clientes · trim. "
+                f"{', '.join(snap.get('repago_periods') or []) or '—'} · último mes "
+                f"{snap.get('latest_period') or '—'}"
+            ),
+            "loaded_at": snap.get("updated_at", "—"),
+        }
+    if snap:
+        return {
+            "ok": None,
+            "name": "Repagos EDF",
+            "detail": "Actualizando snapshot a trimestre + último mes + histórico mensual...",
+            "loaded_at": snap.get("updated_at", "—"),
+        }
+    if _last_error:
+        return {"ok": False, "name": "Repagos EDF", "detail": str(_last_error), "loaded_at": "—"}
+    return {"ok": None, "name": "Repagos EDF", "detail": "Sin snapshot. Se actualizará automáticamente.", "loaded_at": "—"}
 
 def customer(customer_id: str):
     snap = _load_disk()
