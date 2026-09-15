@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 import gzip
 import json
@@ -20,6 +21,8 @@ SNAPSHOT_PATH = CACHE_DIR / "ventas_actual_snapshot.json.gz"
 RUNTIME_DIR = DATA_DIR / "ventas-actual-runtime"
 
 # Mismas fuentes de Planificación / Venta diaria.
+PLANIFICACION_FOLDER_URL = "https://drive.google.com/drive/folders/1cukgXLUaPsEDK_yD7tSwgaBFZAbiDUot"
+# Fallback histórico: si no se puede listar la carpeta, intenta este ID.
 VENTA_DIARIA_ID = "12c7hy-bTbg7P_1QYUyKKcooNLo4iog1x"
 CLIENTES_ID = "1GuRrGKlb7SLjI9h81XssZTpWzgPUrpRb"
 AUXILIARES_ID = "1zXhbWtT7K1tY43MmYz7oTTYifMgmLyFT"
@@ -52,6 +55,117 @@ NABS_DIVISIONS = {"AGUAS", "BEB ENERGIZANTES", "BEBIDAS SABORIZADAS", "GASEOSAS"
 _snapshot = None
 _last_error = None
 _lock = threading.RLock()
+
+
+AR_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
+DAILY_UPLOAD_HOUR = 16
+
+
+def _now_ar() -> datetime:
+    return datetime.now(AR_TZ)
+
+
+def _previous_commercial_day(day: date) -> date:
+    """En DDV hay venta de lunes a sábado; domingo no genera corte comercial."""
+    candidate = day - timedelta(days=1)
+    while candidate.weekday() == 6:  # domingo
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def expected_cutoff(now: datetime | None = None) -> str:
+    """Fecha que debería estar disponible según la rutina de carga diaria.
+
+    Antes de las 16:00 se considera vigente el último día comercial cerrado.
+    Desde las 16:00 se espera la venta del día actual. Los domingos se conserva sábado.
+    """
+    now = now or _now_ar()
+    today = now.date()
+    if today.weekday() == 6:  # domingo
+        expected = _previous_commercial_day(today)
+    elif now.hour >= DAILY_UPLOAD_HOUR:
+        expected = today
+    else:
+        expected = _previous_commercial_day(today)
+    return expected.isoformat()
+
+
+def freshness(now: datetime | None = None) -> dict:
+    snap = _load_disk() or {}
+    actual = str(snap.get("period_end") or "")[:10]
+    expected = expected_cutoff(now)
+    current = bool(actual and actual >= expected)
+    return {
+        "period_end": actual,
+        "expected_cutoff": expected,
+        "is_current": current,
+        "waiting_for_upload": not current,
+        "upload_hour": DAILY_UPLOAD_HOUR,
+    }
+
+
+def needs_refresh(now: datetime | None = None) -> bool:
+    """True mientras el corte esperado todavía no llegó al snapshot."""
+    return not freshness(now).get("is_current", False)
+
+
+def _drive_name(value) -> str:
+    text = _norm(Path(str(value or "")).name)
+    return re.sub(r"\s+", "", text)
+
+
+def _download_current_venta(target: Path):
+    """Busca ventadiaria.txt por nombre dentro de la carpeta de Planificación.
+
+    Esto evita depender del ID fijo: si el archivo se reemplaza/sube de nuevo,
+    el bot toma automáticamente el ID vigente.
+    """
+    import gdown
+
+    candidates = []
+    try:
+        metadata = gdown.download_folder(
+            url=PLANIFICACION_FOLDER_URL,
+            output=str(RUNTIME_DIR / "_drive_index"),
+            quiet=True,
+            use_cookies=False,
+            skip_download=True,
+        )
+        for item in metadata or []:
+            raw_path = str(getattr(item, "path", "") or "")
+            name = Path(raw_path).name
+            compact = _drive_name(name)
+            suffix = Path(name).suffix.lower()
+            if suffix not in {".txt", ".csv"}:
+                continue
+            if "bultos" in compact:
+                continue
+            # Preferencia exacta: ventadiaria.txt. Respaldo: cualquier VENTA + DIARIA.
+            exact = compact in {"ventadiariatxt", "ventadiariacsv"}
+            broad = "venta" in compact and "diaria" in compact
+            if exact or broad:
+                candidates.append((0 if exact else 1, len(raw_path), item, name))
+    except Exception:
+        candidates = []
+
+    if candidates:
+        candidates.sort(key=lambda x: (x[0], x[1], x[3].lower()))
+        last_error = None
+        for _, _, item, _ in candidates:
+            file_id = str(getattr(item, "id", "") or "")
+            if not file_id:
+                continue
+            try:
+                _download_by_id(file_id, target)
+                return target, file_id
+            except Exception as exc:
+                last_error = exc
+        if last_error:
+            raise last_error
+
+    # Fallback si Drive no permite listar la carpeta.
+    _download_by_id(VENTA_DIARIA_ID, target)
+    return target, VENTA_DIARIA_ID
 
 
 def _clean(value) -> str:
@@ -287,7 +401,7 @@ def _records(df: pd.DataFrame):
     return [{k: _json_value(v) for k, v in rec.items()} for rec in df.to_dict("records")]
 
 
-def _build_snapshot(venta_path: Path, clientes_path: Path | None = None, aux_path: Path | None = None):
+def _build_snapshot(venta_path: Path, clientes_path: Path | None = None, aux_path: Path | None = None, drive_file_id: str = ""):
     venta = pd.read_csv(venta_path, sep="\t", encoding="latin1", dtype=str, engine="python")
     required = {
         "Periodos", "Vendedor", "Descripción Vendedor", "Ruta", "Cod. Cliente", "Descripción",
@@ -382,9 +496,10 @@ def _build_snapshot(venta_path: Path, clientes_path: Path | None = None, aux_pat
     min_date = grouped["fecha"].min()
     max_date = grouped["fecha"].max()
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source": "CHESS · ventadiaria.txt · Hectolitros",
+        "drive_file_id": drive_file_id,
         "period_start": min_date.strftime("%Y-%m-%d"),
         "period_end": max_date.strftime("%Y-%m-%d"),
         "period_month": max_date.strftime("%Y-%m"),
@@ -409,7 +524,7 @@ def refresh(force=True):
             if RUNTIME_DIR.exists():
                 shutil.rmtree(RUNTIME_DIR, ignore_errors=True)
             RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-            venta_path = _download_by_id(VENTA_DIARIA_ID, RUNTIME_DIR / "ventadiaria.txt")
+            venta_path, drive_file_id = _download_current_venta(RUNTIME_DIR / "ventadiaria.txt")
             clientes_path = None
             aux_path = None
             try:
@@ -420,7 +535,7 @@ def refresh(force=True):
                 aux_path = _download_by_id(AUXILIARES_ID, RUNTIME_DIR / "AUXILIARES.xlsx")
             except Exception:
                 aux_path = None
-            snap = _build_snapshot(venta_path, clientes_path, aux_path)
+            snap = _build_snapshot(venta_path, clientes_path, aux_path, drive_file_id=drive_file_id)
             _last_error = None
             return _save(snap)
         except Exception as exc:
@@ -431,19 +546,32 @@ def refresh(force=True):
 def status():
     snap = _load_disk()
     if snap:
+        fresh = freshness()
+        expected = fresh.get("expected_cutoff") or ""
+        actual = fresh.get("period_end") or ""
+        def ar(v):
+            try:
+                y, m, d = str(v)[:10].split("-")
+                return f"{d}/{m}/{y}"
+            except Exception:
+                return str(v or "—")
+        if fresh.get("is_current"):
+            freshness_text = f"✅ al día hasta {ar(actual)}"
+        else:
+            freshness_text = f"⏳ corte {ar(actual)} · esperando carga {ar(expected)}"
         return {
             "ok": True,
             "name": "Venta mes actual",
             "detail": (
                 f"{snap.get('period_start','—')} → {snap.get('period_end','—')} · "
-                f"{snap.get('total_hl',0):.1f} HL · {snap.get('clients_count',0)} clientes"
+                f"{snap.get('total_hl',0):.1f} HL · {snap.get('clients_count',0)} clientes · "
+                f"{freshness_text}"
             ),
             "loaded_at": snap.get("updated_at", "—"),
         }
     if _last_error:
         return {"ok": False, "name": "Venta mes actual", "detail": str(_last_error), "loaded_at": "—"}
     return {"ok": None, "name": "Venta mes actual", "detail": "Sin snapshot. Se actualizará automáticamente.", "loaded_at": "—"}
-
 
 def rows():
     snap = _load_disk() or {}
@@ -452,7 +580,9 @@ def rows():
 
 def meta():
     snap = _load_disk() or {}
-    return {k: snap.get(k) for k in (
-        "updated_at", "source", "period_start", "period_end", "period_month",
+    out = {k: snap.get(k) for k in (
+        "updated_at", "source", "drive_file_id", "period_start", "period_end", "period_month",
         "raw_rows", "rows_count", "clients_count", "skus_count", "total_hl",
     )}
+    out.update(freshness())
+    return out
