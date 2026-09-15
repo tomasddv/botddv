@@ -109,6 +109,7 @@ with st.sidebar:
         "repago": "Repago mensual",
         "repago_count": "Conteo por repago",
         "monthly_sales": "Compra mensual",
+        "current_sales": "Venta mes actual",
         "frescura": "Frescura",
         "analyst": "Análisis libre",
         "tope": "Tope de bultos",
@@ -139,7 +140,7 @@ with st.sidebar:
                 st.info("Ya hay una actualización en curso.")
 
 source_status = statuses()
-cols = st.columns(3)
+cols = st.columns(max(1, len(source_status)))
 for col, item in zip(cols, source_status):
     with col:
         state = item.get("ok")
@@ -168,7 +169,7 @@ if ctx.get("active_sku"):
 if ctx.get("active_topic"):
     label = {
         "discount":"Descuentos", "edf_count":"Cantidad EDF", "repago":"Repago mensual",
-        "repago_count":"Conteo repago", "monthly_sales":"Compra mensual", "frescura":"Frescura", "tope":"Tope de bultos", "edf_location":"Ubicación EDF", "analyst":"Análisis libre",
+        "repago_count":"Conteo repago", "monthly_sales":"Compra mensual", "current_sales":"Venta mes actual", "frescura":"Frescura", "tope":"Tope de bultos", "edf_location":"Ubicación EDF", "analyst":"Análisis libre",
     }.get(ctx.get("active_topic"), ctx.get("active_topic"))
     if ctx.get("active_topic") == "discount" and ctx.get("last_discount_segment"):
         label += f" · {ctx.get('last_discount_segment')}"
@@ -181,7 +182,7 @@ if "messages" not in st.session_state or not st.session_state.messages:
         "role":"assistant",
         "content":(
             "👋 **¡Hola! Bienvenido al Asistente Comercial DDV.**  \n\n"
-            "Podés preguntarme directamente lo que necesites sobre **stock, frescura, EDF, repago, ventas mensuales, descuentos y topes**. "
+            "Podés preguntarme directamente lo que necesites sobre **venta del mes corriente, stock, frescura, EDF, repago, ventas históricas, descuentos y topes**. "
             "También puedo **comparar bases, hacer rankings, cruzar fuentes y calcular relaciones** aunque la pregunta no esté programada de antemano.  \n\n"
             "Voy a mantener el contexto de la conversación. **¿Qué querés analizar?**"
         ),

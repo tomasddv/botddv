@@ -5,7 +5,7 @@ import unicodedata
 from collections import Counter
 from typing import Any
 
-from sources import repago_source, frescura_source, grupos_source
+from sources import repago_source, frescura_source, grupos_source, ventas_actual_source
 from analyst_engine import analyze_question, should_analyze
 
 
@@ -849,7 +849,7 @@ def respond(message: str, context: dict[str, Any] | None = None):
     if any(k in text for k in ("ayuda", "que podes", "ejemplos")):
         return (
             "Puedo responder **EDF/heladeras**, **ubicación por número de serie**, **Repago por trimestre o último mes**, "
-            "**ventas mensuales**, **stock/Frescura**, **descuentos** y **topes de bultos Core/Value**. "
+            "**ventas del mes corriente**, **ventas mensuales históricas**, **stock/Frescura**, **descuentos** y **topes de bultos Core/Value**. "
             "Además puedo analizar comparaciones, rankings y cruces entre fuentes sin necesidad de que exista una frase programada exactamente.",
             [], ctx,
         )
@@ -1083,7 +1083,7 @@ def respond(message: str, context: dict[str, Any] | None = None):
 
     return (
         "**No pude traducir esa pregunta a un cálculo seguro con las fuentes actuales.** "
-        "Puedo analizar stock/Frescura, EDF/repago, ventas en HL, descuentos y topes; si me das un poco más de contexto la reformulo.",
+        "Puedo analizar venta del mes corriente, stock/Frescura, EDF/repago, ventas históricas en HL, descuentos y topes; si me das un poco más de contexto la reformulo.",
         [], ctx,
     )
 
@@ -1093,6 +1093,7 @@ def refresh_all():
         ("Repagos / EDF", repago_source.refresh),
         ("Frescura", frescura_source.refresh),
         ("Grupo de clientes", grupos_source.refresh),
+        ("Venta mes actual", ventas_actual_source.refresh),
     ):
         try:
             fn(force=True)
@@ -1103,4 +1104,4 @@ def refresh_all():
 
 
 def statuses():
-    return [repago_source.status(), frescura_source.status(), grupos_source.status()]
+    return [repago_source.status(), frescura_source.status(), grupos_source.status(), ventas_actual_source.status()]

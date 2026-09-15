@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 from typing import Any
 
-from sources import repago_source, frescura_source, grupos_source, planificacion_source
+from sources import repago_source, frescura_source, grupos_source, planificacion_source, ventas_actual_source
 
 _INTERVAL_MINUTES = max(5, int(os.getenv("AUTO_REFRESH_MINUTES", "30") or 30))
 _INTERVAL_SECONDS = _INTERVAL_MINUTES * 60
@@ -29,6 +29,7 @@ _SOURCES = (
     ("Frescura", frescura_source),
     ("Grupo de clientes", grupos_source),
     ("Topes Planificación", planificacion_source),
+    ("Venta mes actual", ventas_actual_source),
 )
 
 
@@ -76,8 +77,6 @@ def ensure_initial_ready() -> dict[str, str]:
 
 
 def _worker() -> None:
-    # Primera actualización completa poco después de arrancar. Mientras tanto,
-    # las consultas usan el snapshot local empaquetado y siguen siendo instantáneas.
     if _stop_event.wait(2.0):
         return
     while not _stop_event.is_set():
@@ -97,7 +96,6 @@ def start_background_updater() -> None:
 
 
 def force_refresh_async() -> bool:
-    """Fallback opcional: dispara una actualización sin bloquear la interfaz."""
     with _lock:
         if _state.get("running"):
             return False

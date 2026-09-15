@@ -9,71 +9,10 @@ from typing import Any
 
 import pandas as pd
 
-from sources import frescura_source, grupos_source, repago_source
+from sources import frescura_source, grupos_source, repago_source, ventas_actual_source
 
 MAX_RESULT_ROWS = 40
 DISPLAY_ROWS = 15
-
-
-# -----------------------------
-# Public status / routing
-# -----------------------------
-
-def _secret(name: str, default: str = "") -> str:
-    value = str(os.environ.get(name, "") or "").strip()
-    if value:
-        return value
-    try:
-        import streamlit as st
-        return str(st.secrets.get(name, default) or default).strip()
-    except Exception:
-        return str(default or "").strip()
-
-
-def analyst_status() -> dict[str, Any]:
-    enabled = bool(_secret("OPENAI_API_KEY"))
-    return {
-        "enabled": enabled,
-        "model": _secret("OPENAI_ANALYST_MODEL", DEFAULT_MODEL) or DEFAULT_MODEL,
-        "detail": "Analista IA activo" if enabled else "Falta OPENAI_API_KEY en Secrets",
-    }
-
-
-def should_analyze(question: str) -> bool:
-    """Detecta preguntas que piden análisis/ranking/comparación y no una búsqueda puntual.
-
-    No intenta comprender toda la pregunta. Sólo decide si conviene saltar directamente
-    al analista universal. Si devuelve False, las reglas rápidas existentes siguen teniendo
-    prioridad y el analista queda igualmente como fallback final.
-    """
-    q = _norm(question)
-    if not q:
-        return False
-
-    plural_or_set = any(term in q for term in (
-        "que productos", "cuales productos", "que sku", "cuales sku",
-        "que clientes", "cuales clientes", "de los clientes", "entre los clientes",
-        "que edf", "cuales edf", "que heladeras", "cuales heladeras",
-        "listame", "lista de", "ranking", "top ", "los que", "las que",
-    ))
-    comparative = any(term in q for term in (
-        "mas que", "menos que", "mayor", "menor", "mucho", "poco", "sobrado",
-        "sobrante", "faltante", "diferencia", "desbalance", "compar", "mejor", "peor",
-        "alto", "bajo", "flojo", "fuerte", "riesgo de quiebre", "oportunidad",
-    ))
-    aggregate = any(term in q for term in (
-        "promedio", "total", "cuantos clientes", "cuantas clientes", "cuantos sku",
-        "cuantos productos", "suma", "acumulado",
-        "porcentaje de", "proporcion", "distribucion",
-    ))
-    cross_source = sum(bool(x) for x in (
-        any(k in q for k in ("repago", "heladera", "edf", "serie")),
-        any(k in q for k in ("descuento", "core", "value")),
-        any(k in q for k in ("tope", "bulto")),
-        any(k in q for k in ("stock", "frescura", "venc", "sku", "producto")),
-    )) >= 2
-
-    return plural_or_set or comparative or aggregate or cross_source
 
 
 # -----------------------------
@@ -346,11 +285,31 @@ def _grupos_frames() -> dict[str, pd.DataFrame]:
     }
 
 
+
+def _ventas_actual_frames() -> dict[str, pd.DataFrame]:
+    snap = _safe_snap(ventas_actual_source)
+    rows = snap.get("rows") or []
+    meta = [{
+        "period_start": snap.get("period_start") or "",
+        "period_end": snap.get("period_end") or "",
+        "period_month": snap.get("period_month") or "",
+        "updated_at": snap.get("updated_at") or "",
+        "total_hl": _num(snap.get("total_hl")) or 0.0,
+        "clientes": int(snap.get("clients_count") or 0),
+        "skus": int(snap.get("skus_count") or 0),
+    }] if snap else []
+    return {
+        "ventas_mes_actual": pd.DataFrame(rows),
+        "ventas_mes_actual_meta": pd.DataFrame(meta),
+        "maestro_clientes_actual": pd.DataFrame(snap.get("customer_master") or []),
+    }
+
 def _frames() -> dict[str, pd.DataFrame]:
     frames = {}
     frames.update(_frescura_frames())
     frames.update(_repago_frames())
     frames.update(_grupos_frames())
+    frames.update(_ventas_actual_frames())
     return frames
 
 
@@ -363,6 +322,9 @@ EMPTY_SCHEMAS = {
     "ventas_mensuales_cliente": ["cliente_codigo", "cliente", "periodo", "negocio", "hl"],
     "descuentos_cliente": ["cliente_codigo", "cliente", "segmento", "subsegmento", "descuento_pct", "grupo", "promotor", "ruta"],
     "topes_cliente": ["cliente_codigo", "cliente", "segmento", "canal", "tope_bultos"],
+    "ventas_mes_actual": ["fecha", "cliente_codigo", "cliente", "razon_social", "nombre_fantasia", "agrupacion", "localidad_base", "lista_precios", "subcanal", "vendedor_codigo", "vendedor", "supervisor", "ruta", "sku", "producto", "marca", "marca_unificada", "segmento", "segmento_2", "segmento_3", "calibre", "calibre_unificado", "division", "producto_estadistico", "unidad_negocio", "ung_top", "calibres_cpr", "foco_comercial", "es_cza", "es_core", "es_value", "es_above_core", "es_premium", "es_balanced", "es_nabs", "es_laton_710", "hl", "importe_neto", "importe_final", "facturas"],
+    "ventas_mes_actual_meta": ["period_start", "period_end", "period_month", "updated_at", "total_hl", "clientes", "skus"],
+    "maestro_clientes_actual": ["cliente_codigo", "razon_social", "nombre_fantasia", "agrupacion", "localidad_base", "lista_precios", "subcanal", "ramo_cliente"],
 }
 
 
@@ -421,14 +383,18 @@ def should_analyze(question: str) -> bool:
         "promedio", "total", "cuantos clientes", "cuantos sku", "cuantos productos",
         "suma", "acumulado", "porcentaje de", "proporcion", "distribucion",
     ))
+    current_sales = (
+        any(k in q for k in ("este mes", "mes actual", "mes corriente", "acumulado del mes", "acumulado mes", "venta diaria", "ventas diarias", "vendimos", "vendido", "vendida", "ultimos", "últimos", "hoy", "ayer"))
+        and any(k in q for k in ("venta", "ventas", "vende", "vend", "compra", "compr", "hl", "hectolit", "factur", "producto", "sku", "cliente", "marca", "division", "negocio"))
+    )
     cross_source = sum(bool(x) for x in (
         any(k in q for k in ("repago", "heladera", "edf", "serie")),
         any(k in q for k in ("descuento", "core", "value")),
         any(k in q for k in ("tope", "bulto")),
         any(k in q for k in ("stock", "frescura", "venc", "sku", "producto")),
-        any(k in q for k in ("venta", "compra", "hl", "hectolit")),
+        any(k in q for k in ("venta", "compra", "hl", "hectolit", "este mes", "mes actual", "mes corriente")),
     )) >= 2
-    return plural_or_set or comparative or aggregate or cross_source
+    return current_sales or plural_or_set or comparative or aggregate or cross_source
 
 
 def _extract_limit(q: str, default: int = 15) -> int:
@@ -492,23 +458,18 @@ def _stock_comparison_plan(q: str) -> dict | None:
         return None
 
     limit = _extract_limit(q)
-    # Dirección inferida por frases relativas.
-    madryn_low = (
-        ("poco" in q or "bajo" in q or "menos" in q or "falt" in q)
-        and q.find("madryn") >= 0
-        and (
-            re.search(r"(poco|bajo|menos|falt\w*)[^.]{0,35}madryn", q)
-            or re.search(r"madryn[^.]{0,35}(poco|bajo|menos|falt\w*)", q)
+    # Dirección inferida por la cláusula cercana a cada ciudad. Evita que
+    # "poco stock en Madryn y mucho en Trelew" marque a ambas como bajas.
+    def low_for(city: str) -> bool:
+        low = r"(?:poco|bajo|escaso|menos|faltante|falt\w*)"
+        city_re = re.escape(city)
+        return bool(
+            re.search(rf"{low}\s+(?:stock\s+)?(?:en|de|para)?\s*{city_re}\b", q)
+            or re.search(rf"\b{city_re}\b\s+(?:con\s+)?(?:stock\s+)?{low}", q)
         )
-    )
-    trelew_low = (
-        ("poco" in q or "bajo" in q or "menos" in q or "falt" in q)
-        and q.find("trelew") >= 0
-        and (
-            re.search(r"(poco|bajo|menos|falt\w*)[^.]{0,35}trelew", q)
-            or re.search(r"trelew[^.]{0,35}(poco|bajo|menos|falt\w*)", q)
-        )
-    )
+
+    madryn_low = low_for("madryn")
+    trelew_low = low_for("trelew")
 
     if madryn_low and not trelew_low:
         sql = f"""
@@ -644,6 +605,558 @@ def _freshness_plan(q: str) -> dict | None:
         "reason": "",
     }
 
+
+
+def _sql_text(value: Any) -> str:
+    return "'" + str(value or "").replace("'", "''") + "'"
+
+
+def _sales_snap() -> dict:
+    return _safe_snap(ventas_actual_source)
+
+
+def _sales_period_note() -> str:
+    snap = _sales_snap()
+    start = str(snap.get("period_start") or "")
+    end = str(snap.get("period_end") or "")
+    if start and end:
+        def ar(v):
+            try:
+                y, m, d = v[:10].split("-")
+                return f"{d}/{m}/{y}"
+            except Exception:
+                return v
+        return f"Venta CHESS del mes corriente, corte **{ar(start)} al {ar(end)}**."
+    return "Venta CHESS del mes corriente según el último snapshot disponible."
+
+
+def _is_current_sales_question(q: str) -> bool:
+    current = any(k in q for k in (
+        "este mes", "mes actual", "mes corriente", "acumulado del mes", "acumulado mes",
+        "venta diaria", "ventas diarias", "vendimos", "vendido", "vendida", "hoy", "ayer",
+        "ultimos dias", "ultimos ", "últimos ",
+    ))
+    sales = any(k in q for k in (
+        "venta", "ventas", "vende", "vend", "compra", "compr", "hl", "hectolit",
+        "factur", "cliente", "producto", "sku", "marca", "division", "negocio",
+    ))
+    return current and sales
+
+
+def _sales_rows() -> list[dict]:
+    return (_sales_snap().get("rows") or [])
+
+
+def _sales_codes(field: str) -> set[str]:
+    return {str(r.get(field) or "") for r in _sales_rows() if str(r.get(field) or "")}
+
+
+def _match_sales_customer(q: str, context: dict[str, Any] | None = None) -> tuple[str, str] | None:
+    rows = _sales_rows()
+    if not rows:
+        return None
+    codes = {str(r.get("cliente_codigo") or "") for r in rows}
+    for code in re.findall(r"(?<!\d)(\d{3,7})(?!\d)", q):
+        clean = code.lstrip("0") or "0"
+        if clean in codes:
+            name = next((str(r.get("nombre_fantasia") or r.get("cliente") or "") for r in rows if str(r.get("cliente_codigo") or "") == clean), "")
+            return clean, name
+
+    ctx = context or {}
+    active = str(ctx.get("active_client_id") or "")
+    followup = (
+        q.startswith("y ")
+        or q in {"este mes", "mes actual", "mes corriente", "ahora", "y este mes", "y ahora"}
+        or any(k in q for k in ("ese cliente", "este cliente", "el mismo cliente", "del mismo"))
+    )
+    if active and active in codes and followup:
+        name = str(ctx.get("active_client_name") or "")
+        return active, name
+
+    candidates = {}
+    for r in rows:
+        cid = str(r.get("cliente_codigo") or "")
+        for field in ("nombre_fantasia", "cliente", "razon_social"):
+            label = str(r.get(field) or "").strip()
+            n = _norm(label)
+            if cid and len(n) >= 4:
+                candidates[(cid, label)] = n
+    matches = [(len(n), cid, label) for (cid, label), n in candidates.items() if n and re.search(rf"(^|\b){re.escape(n)}(\b|$)", q)]
+    if matches:
+        _, cid, label = max(matches)
+        return cid, label
+    return None
+
+
+def _match_sales_sku(q: str, context: dict[str, Any] | None = None) -> tuple[str, str] | None:
+    rows = _sales_rows()
+    if not rows:
+        return None
+    codes = {str(r.get("sku") or "") for r in rows}
+    for code in re.findall(r"(?<!\d)(\d{3,7})(?!\d)", q):
+        clean = code.lstrip("0") or "0"
+        if clean in codes:
+            name = next((str(r.get("producto") or "") for r in rows if str(r.get("sku") or "") == clean), "")
+            return clean, name
+    ctx = context or {}
+    active = str(ctx.get("active_sku") or "")
+    followup = (
+        q.startswith("y ")
+        or q in {"este mes", "mes actual", "mes corriente", "ahora", "y este mes", "y ahora"}
+        or any(k in q for k in ("ese producto", "este producto", "el mismo sku", "del mismo"))
+    )
+    if active and active in codes and followup:
+        return active, str(ctx.get("active_sku_name") or "")
+    # Sólo coincidencias fuertes por descripción completa; evita adivinar con una palabra de marca.
+    candidates = {}
+    for r in rows:
+        sku = str(r.get("sku") or "")
+        label = str(r.get("producto") or "").strip()
+        n = _norm(label)
+        if sku and len(n) >= 8:
+            candidates[(sku, label)] = n
+    matches = [(len(n), sku, label) for (sku, label), n in candidates.items() if n and n in q]
+    if matches:
+        _, sku, label = max(matches)
+        return sku, label
+    return None
+
+
+def _match_sales_seller(q: str) -> tuple[str, str] | None:
+    rows = _sales_rows()
+    candidates = {}
+    for r in rows:
+        code = str(r.get("vendedor_codigo") or "")
+        label = str(r.get("vendedor") or "").strip()
+        n = _norm(label)
+        if code and len(n) >= 5:
+            candidates[(code, label)] = n
+    matches = [(len(n), code, label) for (code, label), n in candidates.items() if n and n in q]
+    if matches:
+        _, code, label = max(matches)
+        return code, label
+    return None
+
+
+def _sales_focus_condition(q: str, alias: str = "v") -> tuple[str, str]:
+    p = alias + "." if alias else ""
+    if "above core" in q or "abovecore" in q:
+        return f"{p}es_above_core=1", "Above Core"
+    if "balanced" in q:
+        return f"{p}es_balanced=1", "Balanced Choices"
+    if "premium" in q:
+        return f"{p}es_premium=1", "Premium"
+    if "value" in q:
+        return f"{p}es_value=1", "Value"
+    if re.search(r"\bcore\b", q):
+        return f"{p}es_core=1", "Core"
+    if "laton 710" in q or "latones 710" in q or "710" in q and "laton" in q:
+        return f"{p}es_laton_710=1", "Latones 710"
+    if "nabs" in q:
+        return f"{p}es_nabs=1", "Nabs"
+    if "cerveza" in q or re.search(r"\bcza\b", q):
+        return f"{p}es_cza=1", "Total CZA"
+    if re.search(r"\bung\b", q):
+        return f"UPPER({p}unidad_negocio) LIKE '%UNG%'", "UNG"
+    if "gaseosa" in q:
+        return f"UPPER({p}division)='GASEOSAS'", "Gaseosas"
+    if "isoton" in q:
+        return f"UPPER({p}division)='ISOTONICAS'", "Isotónicas"
+    if re.search(r"\bagua(s)?\b", q):
+        return f"UPPER({p}division)='AGUAS'", "Aguas"
+    return "", ""
+
+
+def _sales_time_condition(q: str, alias: str = "v") -> tuple[str, str]:
+    p = alias + "." if alias else ""
+    snap = _sales_snap()
+    end = str(snap.get("period_end") or "")[:10]
+    if not end:
+        return "", ""
+    end_ts = pd.to_datetime(end, errors="coerce")
+    if pd.isna(end_ts):
+        return "", ""
+    m = re.search(r"ultimos\s+(\d{1,2})\s+dias", q)
+    if m:
+        days = max(1, min(int(m.group(1)), 31))
+        start = (end_ts - pd.Timedelta(days=days-1)).strftime("%Y-%m-%d")
+        return f"{p}fecha >= '{start}' AND {p}fecha <= '{end}'", f"últimos {days} días disponibles ({start} a {end})"
+    if "ayer" in q:
+        d = (end_ts - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        return f"{p}fecha='{d}'", f"día {d}"
+    if "hoy" in q:
+        # Para el bot, 'hoy' significa la última fecha efectivamente cargada; siempre se aclara el corte.
+        return f"{p}fecha='{end}'", f"última fecha cargada {end}"
+    return "", ""
+
+
+def _sales_filters(q: str, context: dict[str, Any] | None = None, alias: str = "v") -> tuple[list[str], list[str]]:
+    p = alias + "." if alias else ""
+    filters, notes = [], []
+    loc = _location(q)
+    if loc in {"TRELEW", "MADRYN"}:
+        filters.append(f"UPPER({p}localidad_base)={_sql_text(loc)}")
+        notes.append(loc.title())
+    cust = _match_sales_customer(q, context)
+    if cust:
+        filters.append(f"{p}cliente_codigo={_sql_text(cust[0])}")
+        notes.append(f"cliente {cust[0]} · {cust[1]}")
+    sku = _match_sales_sku(q, context)
+    if sku:
+        filters.append(f"{p}sku={_sql_text(sku[0])}")
+        notes.append(f"SKU {sku[0]} · {sku[1]}")
+    seller = _match_sales_seller(q)
+    if seller:
+        filters.append(f"{p}vendedor_codigo={_sql_text(seller[0])}")
+        notes.append(f"vendedor {seller[1]}")
+    focus_cond, focus_label = _sales_focus_condition(q, alias)
+    if focus_cond:
+        filters.append(focus_cond)
+        notes.append(focus_label)
+    time_cond, time_label = _sales_time_condition(q, alias)
+    if time_cond:
+        filters.append(time_cond)
+        notes.append(time_label)
+    return filters, notes
+
+
+def _metric(q: str, alias: str = "v") -> tuple[str, str, str]:
+    p = alias + "." if alias else ""
+    if any(k in q for k in ("importe", "pesos", "facturacion", "facturación", "monto", "dinero", "$")):
+        return f"SUM({p}importe_neto)", "importe_neto", "importe neto"
+    if "factura" in q and any(k in q for k in ("cuantas", "cuántas", "cantidad", "facturas")):
+        return f"SUM({p}facturas)", "facturas", "facturas"
+    return f"SUM({p}hl)", "hl", "HL"
+
+
+def _group_entity(q: str) -> str | None:
+    if any(k in q for k in ("vendedor", "vendedores", "promotor", "promotores")):
+        return "vendedor"
+    if "supervisor" in q or "supervisores" in q:
+        return "supervisor"
+    if "marca" in q or "marcas" in q:
+        return "marca"
+    if "division" in q or "división" in q or "divisiones" in q:
+        return "division"
+    if "unidad de negocio" in q or "por negocio" in q or "negocios" in q:
+        return "unidad_negocio"
+    if any(k in q for k in ("producto", "productos", "sku")):
+        return "producto"
+    if "cliente" in q or "clientes" in q:
+        return "cliente"
+    if any(k in q for k in ("por dia", "por día", "dia vendimos", "día vendimos", "que dia", "qué día")):
+        return "fecha"
+    if "por base" in q or "entre trelew y madryn" in q or "trelew vs madryn" in q:
+        return "localidad_base"
+    return None
+
+
+
+def _sales_no_activity_plan(q: str, context: dict[str, Any] | None = None) -> dict | None:
+    if not _is_current_sales_question(q):
+        return None
+    no_sale = any(k in q for k in ("no compraron", "no compro", "no compró", "sin compra", "sin ventas", "sin venta", "no vendimos", "no se vendieron", "no vendieron"))
+    if not no_sale:
+        return None
+    limit = _extract_limit(q)
+    period_note = _sales_period_note()
+    focus_cond, focus_label = _sales_focus_condition(q, "v")
+    focus_where = f"WHERE {focus_cond}" if focus_cond else ""
+    loc = _location(q)
+
+    if "cliente" in q or "clientes" in q:
+        master_filters = []
+        if loc in {"TRELEW", "MADRYN"}:
+            master_filters.append(f"UPPER(m.localidad_base)={_sql_text(loc)}")
+        master_where = ("WHERE " + " AND ".join(master_filters)) if master_filters else ""
+        sql=f"""
+            WITH s AS (
+                SELECT cliente_codigo, SUM(hl) AS hl_mes
+                FROM ventas_mes_actual v
+                {focus_where}
+                GROUP BY cliente_codigo
+            )
+            SELECT m.cliente_codigo,
+                   COALESCE(NULLIF(m.nombre_fantasia,''),m.razon_social) AS cliente,
+                   m.localidad_base,
+                   ROUND(COALESCE(s.hl_mes,0),2) AS hl_mes
+            FROM maestro_clientes_actual m
+            LEFT JOIN s ON s.cliente_codigo=m.cliente_codigo
+            {master_where + (' AND ' if master_where else 'WHERE ') + 'COALESCE(s.hl_mes,0) <= 0'}
+            ORDER BY m.localidad_base, cliente
+            LIMIT {limit}
+        """
+        return {
+            "action":"query", "title":"Clientes sin compra en el mes", "sql":sql,
+            "assumption": period_note + (f" Controlado sobre el foco {focus_label}." if focus_label else " Universo: maestro de clientes vigente."),
+            "clarifying_question":"", "reason":"",
+        }
+
+    if any(k in q for k in ("producto", "productos", "sku")):
+        sales_filters=[]
+        if focus_cond:
+            sales_filters.append(focus_cond)
+        if loc in {"TRELEW", "MADRYN"}:
+            sales_filters.append(f"UPPER(v.localidad_base)={_sql_text(loc)}")
+        where_sales = ("WHERE " + " AND ".join(sales_filters)) if sales_filters else ""
+        stock_col = {"TRELEW":"stock_trelew", "MADRYN":"stock_madryn"}.get(loc, "stock_total_ddv")
+        sql=f"""
+            WITH s AS (
+                SELECT sku, SUM(hl) AS hl_mes
+                FROM ventas_mes_actual v
+                {where_sales}
+                GROUP BY sku
+            )
+            SELECT f.codigo, f.descripcion, ROUND(f.{stock_col},1) AS stock_bultos,
+                   ROUND(COALESCE(s.hl_mes,0),2) AS hl_mes
+            FROM frescura_productos f
+            LEFT JOIN s ON s.sku=f.codigo
+            WHERE COALESCE(s.hl_mes,0) <= 0
+            ORDER BY f.{stock_col} DESC, f.descripcion
+            LIMIT {limit}
+        """
+        return {
+            "action":"query", "title":"Productos sin venta en el mes", "sql":sql,
+            "assumption": period_note + " Universo de productos: SKU presentes en Frescura.",
+            "clarifying_question":"", "reason":"",
+        }
+    return None
+
+def _sales_stock_cross_plan(q: str, context: dict[str, Any] | None = None) -> dict | None:
+    if not _is_current_sales_question(q) or "stock" not in q:
+        return None
+    loc = _location(q) or "TOTAL DDV"
+    stock_col = {"TRELEW":"stock_trelew", "MADRYN":"stock_madryn", "TOTAL DDV":"stock_total_ddv"}[loc]
+    sales_filters, notes = _sales_filters(q, context, "v")
+    # La localidad elegida aplica a ambas magnitudes para comparar la misma base.
+    where_sales = ("WHERE " + " AND ".join(sales_filters)) if sales_filters else ""
+    limit = _extract_limit(q)
+    low_sales = any(k in q for k in ("poca venta", "poco vende", "poco vendido", "menos venta", "casi no", "baja venta"))
+    high_sales = any(k in q for k in ("mucha venta", "mucho vende", "mas venta", "más venta", "alta venta"))
+    low_stock = any(k in q for k in ("poco stock", "bajo stock", "menos stock", "faltante", "quiebre"))
+    if low_stock and high_sales:
+        order = f"f.{stock_col} ASC, hl_mes DESC"
+        title = f"Poco stock y mucha venta · {loc}"
+    else:
+        order = f"f.{stock_col} DESC, hl_mes ASC"
+        title = f"Mucho stock y poca venta · {loc}"
+    sql = f"""
+        WITH s AS (
+            SELECT sku, SUM(hl) AS hl_mes
+            FROM ventas_mes_actual v
+            {where_sales}
+            GROUP BY sku
+        )
+        SELECT f.codigo, f.descripcion,
+               ROUND(f.{stock_col},1) AS stock_bultos,
+               ROUND(COALESCE(s.hl_mes,0),2) AS hl_mes
+        FROM frescura_productos f
+        LEFT JOIN s ON s.sku=f.codigo
+        WHERE f.{stock_col} > 0
+        ORDER BY {order}
+        LIMIT {limit}
+    """
+    return {
+        "action":"query", "title":title, "sql":sql,
+        "assumption": _sales_period_note() + " Stock en bultos y venta en HL son magnitudes distintas; las muestro juntas para detectar extremos, no como un ratio directo.",
+        "clarifying_question":"", "reason":"",
+    }
+
+
+def _sales_edf_cross_plan(q: str, context: dict[str, Any] | None = None) -> dict | None:
+    if not _is_current_sales_question(q) or not any(k in q for k in ("edf", "heladera", "heladeras", "equipos")):
+        return None
+    filters, notes = _sales_filters(q, context, "v")
+    where_sales = ("WHERE " + " AND ".join(filters)) if filters else ""
+    limit = _extract_limit(q)
+    having = ""
+    m = re.search(r"menos de\s+(\d+(?:[.,]\d+)?)\s*(?:hl|hectolit)", q)
+    if m:
+        having = f"WHERE COALESCE(s.hl_mes,0) < {float(m.group(1).replace(',', '.'))}"
+    elif any(k in q for k in ("no compraron", "sin compra", "sin ventas", "no compran", "no compraron")):
+        having = "WHERE COALESCE(s.hl_mes,0) <= 0"
+    elif re.search(r"mas de\s+(\d+(?:[.,]\d+)?)\s*(?:hl|hectolit)", q):
+        m = re.search(r"mas de\s+(\d+(?:[.,]\d+)?)\s*(?:hl|hectolit)", q)
+        having = f"WHERE COALESCE(s.hl_mes,0) > {float(m.group(1).replace(',', '.'))}"
+    sql = f"""
+        WITH e AS (
+            SELECT cliente_codigo, MAX(cliente) AS cliente, COUNT(*) AS cantidad_edf,
+                   ROUND(AVG(repago_trimestre_pct),1) AS repago_promedio_pct
+            FROM repago_edf
+            WHERE UPPER(estado)='PDV'
+            GROUP BY cliente_codigo
+        ), s AS (
+            SELECT cliente_codigo, MAX(COALESCE(NULLIF(nombre_fantasia,''), cliente)) AS cliente_venta,
+                   SUM(hl) AS hl_mes
+            FROM ventas_mes_actual v
+            {where_sales}
+            GROUP BY cliente_codigo
+        )
+        SELECT e.cliente_codigo, COALESCE(NULLIF(s.cliente_venta,''), e.cliente) AS cliente,
+               e.cantidad_edf, e.repago_promedio_pct,
+               ROUND(COALESCE(s.hl_mes,0),2) AS hl_mes
+        FROM e LEFT JOIN s ON s.cliente_codigo=e.cliente_codigo
+        {having}
+        ORDER BY hl_mes ASC, cantidad_edf DESC
+        LIMIT {limit}
+    """
+    return {
+        "action":"query", "title":"Clientes con EDF vs venta del mes", "sql":sql,
+        "assumption": _sales_period_note() + " EDF: sólo equipos en estado PDV.",
+        "clarifying_question":"", "reason":"",
+    }
+
+
+def _sales_discount_cross_plan(q: str, context: dict[str, Any] | None = None) -> dict | None:
+    if not _is_current_sales_question(q) or "descuento" not in q:
+        return None
+    seg = _segment(q)
+    filters, notes = _sales_filters(q, context, "v")
+    where_sales = ("WHERE " + " AND ".join(filters)) if filters else ""
+    disc_where = f"WHERE d.segmento={_sql_text(seg)}" if seg else ""
+    no_sale = any(k in q for k in ("no compraron", "sin compra", "sin ventas", "no compran"))
+    post = "WHERE COALESCE(s.hl_mes,0) <= 0" if no_sale else ""
+    limit = _extract_limit(q)
+    sql=f"""
+        WITH d AS (
+            SELECT cliente_codigo, MAX(cliente) AS cliente, segmento, MAX(descuento_pct) AS descuento_pct
+            FROM descuentos_cliente d
+            {disc_where}
+            GROUP BY cliente_codigo, segmento
+        ), s AS (
+            SELECT cliente_codigo, SUM(hl) AS hl_mes
+            FROM ventas_mes_actual v
+            {where_sales}
+            GROUP BY cliente_codigo
+        )
+        SELECT d.cliente_codigo, d.cliente, d.segmento, ROUND(d.descuento_pct,2) AS descuento_pct,
+               ROUND(COALESCE(s.hl_mes,0),2) AS hl_mes
+        FROM d LEFT JOIN s ON s.cliente_codigo=d.cliente_codigo
+        {post}
+        ORDER BY hl_mes ASC, descuento_pct DESC
+        LIMIT {limit}
+    """
+    return {
+        "action":"query", "title":"Descuento comercial vs venta del mes", "sql":sql,
+        "assumption": _sales_period_note() + (f" Venta filtrada al foco {seg}." if seg else ""),
+        "clarifying_question":"", "reason":"",
+    }
+
+
+def _current_sales_plan(q: str, context: dict[str, Any] | None = None) -> dict | None:
+    if not _is_current_sales_question(q):
+        return None
+    if not _sales_rows():
+        return {
+            "action":"unavailable", "title":"", "sql":"", "assumption":"", "clarifying_question":"",
+            "reason":"La fuente **Venta mes actual** todavía no tiene snapshot. Se actualizará automáticamente desde ventadiaria.txt.",
+        }
+
+    filters, notes = _sales_filters(q, context, "v")
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+    metric_expr, metric_alias, metric_label = _metric(q, "v")
+    entity = _group_entity(q)
+    limit = _extract_limit(q)
+    low = any(k in q for k in ("menos", "menor", "poco", "bajo", "peor")) and not any(k in q for k in ("mas", "más", "mayor"))
+    direction = "ASC" if low else "DESC"
+    period_note = _sales_period_note()
+
+    # Conteos simples.
+    if any(k in q for k in ("cuantos clientes", "cuántos clientes", "cantidad de clientes")):
+        return {"action":"query", "title":"Clientes compradores del mes", "sql":f"SELECT COUNT(DISTINCT v.cliente_codigo) AS clientes FROM ventas_mes_actual v {where} AND v.hl<>0" if where else "SELECT COUNT(DISTINCT v.cliente_codigo) AS clientes FROM ventas_mes_actual v WHERE v.hl<>0", "assumption":period_note, "clarifying_question":"", "reason":""}
+    if any(k in q for k in ("cuantos productos", "cuántos productos", "cuantos sku", "cuántos sku", "cantidad de sku")):
+        return {"action":"query", "title":"SKU vendidos en el mes", "sql":f"SELECT COUNT(DISTINCT v.sku) AS productos FROM ventas_mes_actual v {where} AND v.hl<>0" if where else "SELECT COUNT(DISTINCT v.sku) AS productos FROM ventas_mes_actual v WHERE v.hl<>0", "assumption":period_note, "clarifying_question":"", "reason":""}
+
+    # Identidad específica: cliente o SKU sin pedir ranking.
+    cust = _match_sales_customer(q, context)
+    sku = _match_sales_sku(q, context)
+    if cust and entity not in {"producto", "vendedor", "marca", "division", "unidad_negocio", "fecha", "localidad_base"}:
+        sql=f"""
+            SELECT v.cliente_codigo, MAX(COALESCE(NULLIF(v.nombre_fantasia,''),v.cliente)) AS cliente,
+                   ROUND(SUM(v.hl),2) AS hl,
+                   ROUND(SUM(CASE WHEN v.es_cza=1 THEN v.hl ELSE 0 END),2) AS hl_cza,
+                   ROUND(SUM(CASE WHEN UPPER(v.unidad_negocio) LIKE '%UNG%' THEN v.hl ELSE 0 END),2) AS hl_ung,
+                   ROUND(SUM(v.importe_neto),2) AS importe_neto
+            FROM ventas_mes_actual v
+            {where}
+            GROUP BY v.cliente_codigo
+        """
+        return {"action":"query", "title":f"Venta mes actual · cliente {cust[0]}", "sql":sql, "assumption":period_note, "clarifying_question":"", "reason":""}
+    if sku and entity not in {"cliente", "vendedor", "marca", "division", "unidad_negocio", "fecha", "localidad_base"}:
+        sql=f"""
+            SELECT v.sku, MAX(v.producto) AS producto, ROUND(SUM(v.hl),2) AS hl,
+                   COUNT(DISTINCT v.cliente_codigo) AS clientes,
+                   ROUND(SUM(v.importe_neto),2) AS importe_neto
+            FROM ventas_mes_actual v
+            {where}
+            GROUP BY v.sku
+        """
+        return {"action":"query", "title":f"Venta mes actual · SKU {sku[0]}", "sql":sql, "assumption":period_note, "clarifying_question":"", "reason":""}
+
+    # Rankings/agrupaciones.
+    if entity == "cliente":
+        select="v.cliente_codigo, MAX(COALESCE(NULLIF(v.nombre_fantasia,''),v.cliente)) AS cliente"
+        group="v.cliente_codigo"
+    elif entity == "producto":
+        select="v.sku, MAX(v.producto) AS producto"
+        group="v.sku"
+    elif entity == "vendedor":
+        select="v.vendedor_codigo, MAX(v.vendedor) AS vendedor, MAX(v.supervisor) AS supervisor"
+        group="v.vendedor_codigo"
+    elif entity == "supervisor":
+        select="v.supervisor"
+        group="v.supervisor"
+    elif entity == "marca":
+        select="v.marca_unificada AS marca"
+        group="v.marca_unificada"
+    elif entity == "division":
+        select="v.division"
+        group="v.division"
+    elif entity == "unidad_negocio":
+        select="v.unidad_negocio"
+        group="v.unidad_negocio"
+    elif entity == "fecha":
+        select="v.fecha"
+        group="v.fecha"
+        if any(k in q for k in ("que dia", "qué día", "dia vendimos mas", "día vendimos más", "dia vendimos menos", "día vendimos menos")):
+            limit=1
+    elif entity == "localidad_base":
+        select="COALESCE(NULLIF(v.localidad_base,''),'SIN BASE') AS localidad_base"
+        group="COALESCE(NULLIF(v.localidad_base,''),'SIN BASE')"
+    else:
+        # Total del mes/filtro pedido.
+        sql=f"""
+            SELECT ROUND(SUM(v.hl),2) AS hl,
+                   ROUND(SUM(v.importe_neto),2) AS importe_neto,
+                   COUNT(DISTINCT v.cliente_codigo) AS clientes,
+                   COUNT(DISTINCT v.sku) AS productos
+            FROM ventas_mes_actual v
+            {where}
+        """
+        title="Venta acumulada del mes"
+        if notes:
+            title += " · " + " · ".join(notes)
+        return {"action":"query", "title":title, "sql":sql, "assumption":period_note, "clarifying_question":"", "reason":""}
+
+    having=""
+    m=re.search(r"menos de\s+(\d+(?:[.,]\d+)?)\s*(?:hl|hectolit)", q)
+    if m and metric_alias == "hl":
+        having=f"HAVING SUM(v.hl) < {float(m.group(1).replace(',', '.'))}"
+    m2=re.search(r"mas de\s+(\d+(?:[.,]\d+)?)\s*(?:hl|hectolit)", q)
+    if m2 and metric_alias == "hl":
+        having=f"HAVING SUM(v.hl) > {float(m2.group(1).replace(',', '.'))}"
+
+    sql=f"""
+        SELECT {select}, ROUND({metric_expr},2) AS {metric_alias}
+        FROM ventas_mes_actual v
+        {where}
+        GROUP BY {group}
+        {having}
+        ORDER BY {metric_alias} {direction}
+        LIMIT {limit}
+    """
+    title=f"Venta del mes por {entity.replace('_',' ')}"
+    return {"action":"query", "title":title, "sql":sql, "assumption":period_note, "clarifying_question":"", "reason":""}
 
 def _customer_cross_plan(q: str) -> dict | None:
     customer_domain = any(k in q for k in (
@@ -823,13 +1336,14 @@ def _local_plan(question: str, context: dict[str, Any] | None = None) -> dict:
             "clarifying_question":"¿Qué querés consultar?", "reason":"pregunta vacía",
         }
 
-    planners = (
-        _stock_comparison_plan,
-        _stock_ranking_plan,
-        _freshness_plan,
-        _customer_cross_plan,
-    )
-    for planner in planners:
+    # Cruces con venta mes actual tienen prioridad para que "este mes" nunca caiga
+    # en el histórico mensual de Repago.
+    for planner in (_sales_stock_cross_plan, _sales_edf_cross_plan, _sales_discount_cross_plan, _sales_no_activity_plan, _current_sales_plan):
+        plan = planner(q, context)
+        if plan:
+            return plan
+
+    for planner in (_stock_comparison_plan, _stock_ranking_plan, _freshness_plan, _customer_cross_plan):
         plan = planner(q)
         if plan:
             return plan
@@ -845,7 +1359,7 @@ def _local_plan(question: str, context: dict[str, Any] | None = None) -> dict:
     return {
         "action":"unavailable", "title":"", "sql":"", "assumption":"",
         "clarifying_question":"",
-        "reason":"Puedo analizar libremente stock/Frescura, EDF/repago, ventas en HL, descuentos y topes, pero no pude traducir esta frase a un cálculo seguro con las columnas disponibles.",
+        "reason":"Puedo analizar libremente venta del mes corriente, stock/Frescura, EDF/repago, ventas históricas en HL, descuentos y topes, pero no pude traducir esta frase a un cálculo seguro con las columnas disponibles.",
     }
 
 
@@ -874,6 +1388,7 @@ ALLOWED_TABLES = {
     "frescura_productos", "frescura_lotes", "frescura_perfiles",
     "clientes", "repago_edf", "ventas_mensuales_cliente",
     "descuentos_cliente", "topes_cliente",
+    "ventas_mes_actual", "ventas_mes_actual_meta", "maestro_clientes_actual",
 }
 
 
@@ -906,8 +1421,9 @@ def _execute(sql: str) -> tuple[pd.DataFrame, list[str]]:
         conn.close()
     if len(df) > MAX_RESULT_ROWS:
         df = df.head(MAX_RESULT_ROWS).copy()
-    used = [name for name in ALLOWED_TABLES if re.search(rf"\b{re.escape(name)}\b", clean, flags=re.I)]
-    return df, sorted(used)
+    refs = re.findall(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)", clean, flags=re.I)
+    used = sorted({ref.lower() for ref in refs if ref.lower() in ALLOWED_TABLES})
+    return df, used
 
 
 # -----------------------------
@@ -933,6 +1449,23 @@ FRIENDLY = {
     "descuento_pct": "Descuento %",
     "cantidad": "Cantidad",
     "total": "Total",
+    "hl": "HL",
+    "hl_mes": "HL mes",
+    "hl_cza": "HL CZA",
+    "hl_ung": "HL UNG",
+    "importe_neto": "Importe neto",
+    "importe_final": "Importe final",
+    "facturas": "Facturas",
+    "sku": "SKU",
+    "producto": "Producto",
+    "vendedor": "Vendedor",
+    "vendedor_codigo": "Código vendedor",
+    "supervisor": "Supervisor",
+    "marca": "Marca",
+    "division": "División",
+    "unidad_negocio": "Unidad de negocio",
+    "localidad_base": "Base",
+    "stock_bultos": "Stock bultos",
 }
 
 
@@ -999,6 +1532,8 @@ def _source_labels(tables: list[str]) -> list[str]:
         out.append("Grupo de clientes · snapshot local")
     if "topes_cliente" in tables:
         out.append("Planificación · topes local")
+    if any(t.startswith("ventas_mes_actual") or t == "maestro_clientes_actual" for t in tables):
+        out.append("CHESS · venta mes actual · snapshot local")
     out.append("Analista DDV · SQL local")
     return out
 
