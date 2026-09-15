@@ -11,7 +11,7 @@ import pandas as pd
 
 from sources import frescura_source, grupos_source, repago_source, ventas_actual_source
 
-MAX_RESULT_ROWS = 40
+MAX_RESULT_ROWS = 500
 DISPLAY_ROWS = 15
 
 # Conserva la última consulta analítica para interpretar repreguntas/correcciones
@@ -427,7 +427,12 @@ def should_analyze(question: str) -> bool:
         "no vendio", "no vendieron", "no compro", "no compraron"
     ))
     purchase_date = _is_purchase_date_question(q)
-    return current_sales or plural_or_set or comparative or aggregate or cross_source or correction_followup or zero_repago or purchase_date
+    freshness_month_list = (
+        "frescura" in q
+        and ("mes" in q or bool(_extract_freshness_months(q)))
+        and any(k in q for k in ("producto", "productos", "sku", "venc", "frescura"))
+    )
+    return current_sales or plural_or_set or comparative or aggregate or cross_source or correction_followup or zero_repago or purchase_date or freshness_month_list
 
 
 def _extract_limit(q: str, default: int = 15) -> int:
@@ -606,6 +611,98 @@ def _stock_ranking_plan(q: str) -> dict | None:
         "assumption": "Usé el stock físico actual del snapshot de Frescura.",
         "clarifying_question": "",
         "reason": "",
+    }
+
+
+
+
+def _extract_freshness_months(q: str) -> list[str]:
+    """Extrae meses pedidos para consultas de Frescura.
+
+    Soporta formas como "mes 09 y 10", "meses 9, 10", "septiembre y octubre".
+    Devuelve meses con dos dígitos, sin duplicados y en el orden pedido.
+    """
+    qn = _norm(q)
+    month_names = {
+        "enero": "01", "febrero": "02", "marzo": "03", "abril": "04",
+        "mayo": "05", "junio": "06", "julio": "07", "agosto": "08",
+        "septiembre": "09", "setiembre": "09", "octubre": "10",
+        "noviembre": "11", "diciembre": "12",
+    }
+    found: list[tuple[int, str]] = []
+    for name, num in month_names.items():
+        for m in re.finditer(rf"\b{re.escape(name)}\b", qn):
+            found.append((m.start(), num))
+
+    # Si aparece "mes/meses", tomar los números de 1 a 12 que siguen en esa frase.
+    # También cubre la forma habitual "mes 09 y 10".
+    for m in re.finditer(r"\b(?:mes|meses)\b([^.;]*)", qn):
+        tail = m.group(1)
+        base = m.start(1)
+        for n in re.finditer(r"(?<!\d)(0?[1-9]|1[0-2])(?!\d)", tail):
+            found.append((base + n.start(), f"{int(n.group(1)):02d}"))
+
+    found.sort(key=lambda x: x[0])
+    out: list[str] = []
+    for _, month in found:
+        if month not in out:
+            out.append(month)
+    return out
+
+
+def _freshness_month_products_plan(q: str) -> dict | None:
+    """Lista todos los productos de Frescura que vencen en los meses pedidos."""
+    if "frescura" not in q:
+        return None
+    months = _extract_freshness_months(q)
+    if not months:
+        return None
+    if not any(k in q for k in ("producto", "productos", "sku", "venc", "mes", "meses")):
+        return None
+
+    loc = _location(q) or "TOTAL DDV"
+    month_sql = ", ".join(_sql_text(m) for m in months)
+    month_label = " y ".join(months)
+    loc_label = loc.title() if loc != "TOTAL DDV" else "Total DDV"
+
+    return {
+        "action": "query",
+        "title": f"Productos de Frescura · meses {month_label} · {loc_label}",
+        "sql": f"""
+            SELECT codigo,
+                   descripcion,
+                   substr(vencimiento,6,2) AS mes,
+                   MIN(vencimiento) AS proximo_vencimiento,
+                   ROUND(SUM(stock_lote),1) AS stock_bultos,
+                   ROUND(SUM(riesgo_bultos),1) AS riesgo_bultos,
+                   CASE
+                       WHEN MAX(CASE WHEN UPPER(estado)='CRITICO' THEN 3
+                                     WHEN UPPER(estado)='ACCIONAR' THEN 2
+                                     WHEN UPPER(estado)='OK' THEN 1 ELSE 0 END)=3 THEN 'CRITICO'
+                       WHEN MAX(CASE WHEN UPPER(estado)='CRITICO' THEN 3
+                                     WHEN UPPER(estado)='ACCIONAR' THEN 2
+                                     WHEN UPPER(estado)='OK' THEN 1 ELSE 0 END)=2 THEN 'ACCIONAR'
+                       WHEN MAX(CASE WHEN UPPER(estado)='CRITICO' THEN 3
+                                     WHEN UPPER(estado)='ACCIONAR' THEN 2
+                                     WHEN UPPER(estado)='OK' THEN 1 ELSE 0 END)=1 THEN 'OK'
+                       ELSE MAX(estado)
+                   END AS estado
+            FROM frescura_lotes
+            WHERE localidad={_sql_text(loc)}
+              AND vencimiento IS NOT NULL
+              AND length(vencimiento) >= 7
+              AND substr(vencimiento,6,2) IN ({month_sql})
+            GROUP BY codigo, descripcion, substr(vencimiento,6,2)
+            ORDER BY substr(vencimiento,6,2), MIN(vencimiento), descripcion
+        """,
+        "assumption": (
+            f"Traigo todos los SKU del snapshot de Frescura con vencimiento en los meses {month_label}. "
+            f"Ámbito: {loc_label}. Si un SKU tiene más de un lote en el mismo mes, acumulo su stock y riesgo y muestro el vencimiento más próximo."
+        ),
+        "clarifying_question": "",
+        "reason": "",
+        "display_all": True,
+        "intent": "frescura_meses",
     }
 
 
@@ -1914,6 +2011,12 @@ def _local_plan(question: str, context: dict[str, Any] | None = None) -> dict:
             "clarifying_question":"¿Qué querés consultar?", "reason":"pregunta vacía",
         }
 
+    # Listados de Frescura por mes deben resolverse como conjuntos completos,
+    # sin exigir un SKU individual. Ej.: "productos frescura mes 09 y 10".
+    plan = _freshness_month_products_plan(q)
+    if plan:
+        return plan
+
     # Repago + venta 0 es un cruce específico del snapshot de Repago y debe
     # resolverse antes que la venta CHESS del mes corriente. También se atienden
     # primero las repreguntas de corrección ("esos no tienen venta 0").
@@ -2057,6 +2160,10 @@ FRIENDLY = {
     "unidad_negocio": "Unidad de negocio",
     "localidad_base": "Base",
     "stock_bultos": "Stock bultos",
+    "mes": "Mes",
+    "proximo_vencimiento": "Próximo vencimiento",
+    "riesgo_bultos": "Riesgo bultos",
+    "estado": "Estado",
 }
 
 
@@ -2108,9 +2215,13 @@ def _format_answer(plan: dict, df: pd.DataFrame) -> str:
             parts.append(f"**{label}:** {_format_value(row[col])}")
         answer = f"**{title}**\n\n" + "  \n".join(parts)
     else:
-        answer = f"**{title}**\n\nEncontré **{len(df)} resultado(s)**. Los principales son:\n\n{_markdown_table(df)}"
-        if len(df) > DISPLAY_ROWS:
-            answer += f"\n\n_Muestro los primeros {DISPLAY_ROWS} del resultado calculado._"
+        show_all = bool(plan.get("display_all"))
+        if show_all:
+            answer = f"**{title}**\n\nEncontré **{len(df)} resultado(s)**:\n\n{_markdown_table(df, limit=len(df))}"
+        else:
+            answer = f"**{title}**\n\nEncontré **{len(df)} resultado(s)**. Los principales son:\n\n{_markdown_table(df)}"
+            if len(df) > DISPLAY_ROWS:
+                answer += f"\n\n_Muestro los primeros {DISPLAY_ROWS} del resultado calculado._"
 
     if assumption:
         answer += f"\n\n_Criterio usado: {assumption}_"
