@@ -1634,8 +1634,27 @@ def _sales_discount_cross_plan(q: str, context: dict[str, Any] | None = None) ->
 
 
 def _promoter_values() -> list[str]:
-    """Promotores conocidos por Grupo de clientes, Venta diaria y dashboard KPI."""
+    """Promotores conocidos por el dashboard KPI, Grupo de clientes y Venta diaria.
+
+    El padrón estático del propio dashboard se incorpora siempre para poder reconocer
+    nombres aunque el snapshot de rutas todavía esté refrescando.
+    """
     values: dict[str, str] = {}
+
+    # Fuente canónica del repo promotores_kpi_dashboard.
+    for raw in (getattr(promotores_kpi_source, "SUPERVISORES", {}) or {}).keys():
+        raw = str(raw or "").strip()
+        key = _norm(raw)
+        if raw and key:
+            values.setdefault(key, raw)
+
+    kpi = _safe_snap(promotores_kpi_source)
+    for row in kpi.get("route_clients") or []:
+        raw = str(row.get("promotor") or "").strip()
+        key = _norm(raw)
+        if raw and key and not raw.upper().startswith("VND "):
+            values.setdefault(key, raw)
+
     snap = _safe_snap(grupos_source)
     for rows in (snap.get("rows_by_customer") or {}).values():
         for row in rows or []:
@@ -1643,67 +1662,69 @@ def _promoter_values() -> list[str]:
             key = _norm(raw)
             if raw and key:
                 values.setdefault(key, raw)
+
     sales = _safe_snap(ventas_actual_source)
     for row in sales.get("rows") or []:
         raw = str(row.get("vendedor") or "").strip()
         key = _norm(raw)
         if raw and key and not raw.upper().startswith("VND "):
             values.setdefault(key, raw)
-    kpi = _safe_snap(promotores_kpi_source)
-    for row in kpi.get("route_clients") or []:
-        raw = str(row.get("promotor") or "").strip()
-        key = _norm(raw)
-        if raw and key and not raw.upper().startswith("VND "):
-            values.setdefault(key, raw)
     return sorted(values.values(), key=lambda x: _norm(x))
+
+
+def _person_tokens_present(raw: str, question: str) -> bool:
+    """Compara nombres sin exigir el orden apellido/nombre.
+
+    Ej.: el tablero puede guardar `VILLAGRA ENZO` y el usuario escribir
+    `Enzo Villagra`. Para evitar falsos positivos se exigen todos los tokens.
+    """
+    tokens = [t for t in _norm(raw).split() if len(t) > 1]
+    if len(tokens) < 2:
+        return False
+    qn = _norm(question)
+    return all(re.search(rf"(?<!\w){re.escape(token)}(?!\w)", qn) for token in tokens)
 
 
 def _requested_promoters(q: str) -> list[str]:
     """Reconoce uno o varios nombres reales de promotor mencionados en la frase."""
     qn = _norm(q)
     found: list[str] = []
+    seen: set[str] = set()
     for raw in sorted(_promoter_values(), key=lambda x: (-len(_norm(x)), _norm(x))):
         nv = _norm(raw)
         if len(nv) < 3:
             continue
-        if re.search(rf"(^|\b){re.escape(nv)}(\b|$)", qn):
+        exact = bool(re.search(rf"(?<!\w){re.escape(nv)}(?!\w)", qn))
+        flexible = _person_tokens_present(raw, qn)
+        key = _norm(raw)
+        if (exact or flexible) and key not in seen:
             found.append(raw)
+            seen.add(key)
     return found
 
 
 def _promoter_mapping_cte(q: str) -> tuple[str, list[str]]:
-    """Asignación cliente↔promotor.
+    """Asignación cliente↔promotor tomada del maestro de rutas Promotores KPI.
 
-    Prioriza el maestro de rutas del dashboard Promotores y usa Grupo de clientes
-    como respaldo para clientes que todavía no estén en ese maestro.
+    A partir de v13.2 el tablero KPI es la fuente canónica para promotor/supervisor.
+    CHESS aporta las ventas y Repago aporta EDF, pero ninguno redefine qué cliente
+    pertenece a qué promotor.
     """
     requested = _requested_promoters(q)
+    supervisor = _promoter_supervisor(q)
     route_conditions = ["TRIM(COALESCE(promotor,''))<>''"]
-    group_conditions = ["TRIM(COALESCE(promotor,''))<>''"]
     if requested:
         values = ",".join(_sql_text(x.upper()) for x in requested)
         route_conditions.append(f"UPPER(promotor) IN ({values})")
-        group_conditions.append(f"UPPER(promotor) IN ({values})")
+    if supervisor:
+        route_conditions.append(f"UPPER(supervisor)={_sql_text(supervisor)}")
     rw = " AND ".join(route_conditions)
-    gw = " AND ".join(group_conditions)
     cte = f"""
-        pm_route AS (
+        pm AS (
             SELECT cliente_codigo, MAX(cliente) AS cliente, promotor, MAX(supervisor) AS supervisor
             FROM promotores_ruta
             WHERE {rw}
             GROUP BY cliente_codigo, promotor
-        ),
-        pm_group AS (
-            SELECT d.cliente_codigo, MAX(d.cliente) AS cliente, d.promotor, '' AS supervisor
-            FROM descuentos_cliente d
-            WHERE {gw}
-              AND NOT EXISTS (SELECT 1 FROM pm_route r WHERE r.cliente_codigo=d.cliente_codigo)
-            GROUP BY d.cliente_codigo, d.promotor
-        ),
-        pm AS (
-            SELECT * FROM pm_route
-            UNION ALL
-            SELECT * FROM pm_group
         )
     """
     return cte, requested
@@ -1833,7 +1854,7 @@ def _promoter_dashboard_plan(q: str, context: dict[str, Any] | None = None) -> d
     kpi_snap = _safe_snap(promotores_kpi_source)
     has_routes = bool(kpi_snap.get("route_clients"))
     has_plan = bool(kpi_snap.get("plan_rows"))
-    if (wants_route_clients or wants_plan) and not has_routes:
+    if not has_routes:
         return {
             "action":"unavailable", "title":"", "sql":"", "assumption":"", "clarifying_question":"",
             "reason":"La fuente **Promotores KPI** todavía no tiene el maestro de rutas cargado. Se actualizará automáticamente desde RUTAS / reporte de clientes.",
@@ -2036,11 +2057,23 @@ def _promoter_analytics_plan(q: str, context: dict[str, Any] | None = None) -> d
     """
     qn = _norm(q)
     requested_promoters = _requested_promoters(qn)
-    if "promotor" not in qn and "promotores" not in qn and not requested_promoters:
+    supervisor = _promoter_supervisor(qn)
+    if "promotor" not in qn and "promotores" not in qn and not requested_promoters and not supervisor:
         return None
+
+    # Si la pregunta identifica una persona/supervisor del dashboard, no dejamos que
+    # caiga al cálculo general de CHESS mientras Promotores KPI esté sin cargar.
+    kpi_snap = _safe_snap(promotores_kpi_source)
+    if not (kpi_snap.get("route_clients") or []):
+        return {
+            "action":"unavailable", "title":"", "sql":"", "assumption":"", "clarifying_question":"",
+            "reason":"La fuente **Promotores KPI** todavía no tiene el maestro de rutas cargado. Actualizá las fuentes y volvé a consultar.",
+        }
 
     pm_cte, requested_promoters = _promoter_mapping_cte(qn)
     promoter_note = ("Promotor: " + ", ".join(requested_promoters) + ". ") if requested_promoters else ""
+    if supervisor:
+        promoter_note += f"Supervisor: {supervisor}. "
     period_note = _sales_period_note()
     limit = max(_extract_limit(qn, default=40), 40)
 
@@ -2156,7 +2189,7 @@ def _promoter_analytics_plan(q: str, context: dict[str, Any] | None = None) -> d
             title = "Clientes sin compra por promotor" if no_purchase else "Activación de clientes por promotor"
             return {
                 "action":"query", "title":title, "sql":sql,
-                "assumption":promoter_note + period_note + (" Filtros: " + ", ".join(sales_notes) + "." if sales_notes else ""),
+                "assumption":promoter_note + period_note + " Asignación cliente-promotor tomada del maestro de rutas de Promotores KPI." + (" Filtros: " + ", ".join(sales_notes) + "." if sales_notes else ""),
                 "clarifying_question":"", "reason":"", "intent":"promotor_activacion",
             }
 
@@ -2180,7 +2213,7 @@ def _promoter_analytics_plan(q: str, context: dict[str, Any] | None = None) -> d
             """
             return {
                 "action":"query", "title":"Clientes con compra por promotor", "sql":sql,
-                "assumption":promoter_note + period_note + (" Filtros: " + ", ".join(sales_notes) + "." if sales_notes else ""),
+                "assumption":promoter_note + period_note + " Asignación cliente-promotor tomada del maestro de rutas de Promotores KPI." + (" Filtros: " + ", ".join(sales_notes) + "." if sales_notes else ""),
                 "clarifying_question":"", "reason":"", "intent":"promotor_clientes",
                 "display_all": "todos" in qn,
             }
@@ -2284,7 +2317,7 @@ def _promoter_analytics_plan(q: str, context: dict[str, Any] | None = None) -> d
                 title = "Clientes con compra por promotor"
             else:
                 title = "Venta por promotor" + dim_label
-            assumption = promoter_note + period_note
+            assumption = promoter_note + period_note + " Asignación cliente-promotor tomada del maestro de rutas de Promotores KPI."
 
         if sales_notes:
             assumption += " Filtros: " + ", ".join(sales_notes) + "."
@@ -2308,7 +2341,7 @@ def _promoter_analytics_plan(q: str, context: dict[str, Any] | None = None) -> d
     """
     return {
         "action":"query", "title":"Clientes asignados por promotor", "sql":sql,
-        "assumption":promoter_note + "Asignación tomada del snapshot de Grupo de clientes.",
+        "assumption":promoter_note + "Asignación tomada del maestro de rutas de Promotores KPI.",
         "clarifying_question":"", "reason":"", "intent":"promotor_clientes_asignados",
     }
 
@@ -2904,6 +2937,7 @@ ALLOWED_TABLES = {
     "clientes", "repago_edf", "ventas_mensuales_cliente",
     "descuentos_cliente", "topes_cliente",
     "ventas_mes_actual", "ventas_mes_actual_meta", "maestro_clientes_actual",
+    "promotores_ruta", "promotores_plan",
 }
 
 
@@ -3087,6 +3121,8 @@ def _source_labels(tables: list[str]) -> list[str]:
         out.append("Planificación · topes local")
     if any(t.startswith("ventas_mes_actual") or t == "maestro_clientes_actual" for t in tables):
         out.append("CHESS · venta mes actual · snapshot local")
+    if any(t in {"promotores_ruta", "promotores_plan"} for t in tables):
+        out.append("Promotores KPI · rutas / planificación · snapshot local")
     out.append("Analista DDV · SQL local")
     return out
 
