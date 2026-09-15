@@ -14,6 +14,11 @@ from sources import frescura_source, grupos_source, repago_source, ventas_actual
 MAX_RESULT_ROWS = 40
 DISPLAY_ROWS = 15
 
+# Conserva la última consulta analítica para interpretar repreguntas/correcciones
+# breves como "esos no tienen venta 0". El contexto de sesión, cuando existe,
+# tiene prioridad sobre este fallback de proceso.
+_LAST_ANALYST_TURN: dict[str, Any] = {}
+
 
 # -----------------------------
 # Snapshot -> local SQL tables
@@ -394,7 +399,18 @@ def should_analyze(question: str) -> bool:
         any(k in q for k in ("stock", "frescura", "venc", "sku", "producto")),
         any(k in q for k in ("venta", "compra", "hl", "hectolit", "este mes", "mes actual", "mes corriente")),
     )) >= 2
-    return current_sales or plural_or_set or comparative or aggregate or cross_source
+    correction_followup = (
+        "venta" in q
+        and any(k in q for k in (
+            "esos no", "esas no", "no son esos", "no son esas", "esos tienen",
+            "esas tienen", "me trajiste", "me mostraste", "esta mal", "no esta bien"
+        ))
+    )
+    zero_repago = "repago" in q and any(k in q for k in (
+        "venta 0", "venta cero", "sin venta", "sin ventas", "0 hl", "cero hl",
+        "no vendio", "no vendieron", "no compro", "no compraron"
+    ))
+    return current_sales or plural_or_set or comparative or aggregate or cross_source or correction_followup or zero_repago
 
 
 def _extract_limit(q: str, default: int = 15) -> int:
@@ -1169,6 +1185,162 @@ def _sales_stock_cross_plan(q: str, context: dict[str, Any] | None = None) -> di
     }
 
 
+
+def _zero_sales_requested(q: str) -> bool:
+    qn = _norm(q)
+    return bool(
+        re.search(r"\bventa\s*(?:=|de)?\s*0\b", qn)
+        or "venta cero" in qn
+        or "sin venta" in qn
+        or "sin ventas" in qn
+        or re.search(r"\b0\s*hl\b", qn)
+        or "cero hl" in qn
+        or any(k in qn for k in ("no vendio", "no vendieron", "no compro", "no compraron"))
+    )
+
+
+def _repago_business(q: str) -> tuple[str, str, str, str]:
+    """Negocio pedido en Repago.
+
+    Retorna: etiqueta, columna último período, columna último mes completo,
+    condición SQL sobre repago_edf.negocio.
+    """
+    qn = _norm(q)
+    norm_business = "UPPER(COALESCE(negocio,''))"
+    if "cerveza" in qn or re.search(r"\bcza\b", qn):
+        return (
+            "CERVEZA / CZA",
+            "hl_cza_ultimo_periodo",
+            "hl_cza_ultimo_mes",
+            f"({norm_business} LIKE '%CZA%' OR {norm_business} LIKE '%CERVEZA%')",
+        )
+    if re.search(r"\bung\b", qn):
+        return (
+            "UNG",
+            "hl_ung_ultimo_periodo",
+            "hl_ung_ultimo_mes",
+            f"{norm_business} LIKE '%UNG%'",
+        )
+    if re.search(r"\bagua(?:s)?\b", qn):
+        return (
+            "AGUAS",
+            "hl_aguas_ultimo_periodo",
+            "hl_aguas_ultimo_mes",
+            f"{norm_business} LIKE '%AGUA%'",
+        )
+    if "redbull" in qn or "red bull" in qn or re.search(r"\brb\b", qn):
+        return (
+            "RED BULL",
+            "hl_rb_ultimo_periodo",
+            "hl_rb_ultimo_mes",
+            f"(TRIM({norm_business})='RB' OR {norm_business} LIKE '%RED%BULL%')",
+        )
+    return ("TOTAL", "hl_ultimo_periodo", "hl_ultimo_mes_completo", "1=1")
+
+
+def _repago_zero_sales_plan(q: str, context: dict[str, Any] | None = None) -> dict | None:
+    """Clientes de Repago con venta exactamente 0 para el negocio solicitado.
+
+    Importante: usa las ventas del propio snapshot de Repago, no la venta CHESS
+    corriente. Además limita el universo a clientes con EDF en estado PDV del
+    negocio pedido, para que "Repago solo de cerveza" no mezcle otros negocios.
+    """
+    qn = _norm(q)
+    if "repago" not in qn or not _zero_sales_requested(qn):
+        return None
+    if not any(k in qn for k in ("cliente", "clientes", "quienes", "cuales", "que ")):
+        return None
+
+    business_label, latest_col, full_col, edf_business_cond = _repago_business(qn)
+    use_full_month = any(k in qn for k in ("ultimo mes completo", "mes completo", "mes pasado", "mes anterior"))
+    sales_col = full_col if use_full_month else latest_col
+    period_col = "ultimo_mes_completo" if use_full_month else "ultimo_periodo_disponible"
+    hl_alias = {
+        "CERVEZA / CZA": "hl_cza",
+        "UNG": "hl_ung",
+        "AGUAS": "hl_aguas",
+        "RED BULL": "hl_rb",
+        "TOTAL": "hl",
+    }[business_label]
+
+    sql = f"""
+        WITH e AS (
+            SELECT cliente_codigo, MAX(cliente) AS cliente, COUNT(*) AS cantidad_edf
+            FROM repago_edf
+            WHERE UPPER(estado)='PDV' AND {edf_business_cond}
+            GROUP BY cliente_codigo
+        )
+        SELECT e.cliente_codigo,
+               COALESCE(NULLIF(c.cliente,''), e.cliente) AS cliente,
+               e.cantidad_edf,
+               ROUND(COALESCE(c.{sales_col},0),2) AS {hl_alias},
+               c.{period_col} AS periodo
+        FROM e
+        JOIN clientes c ON c.cliente_codigo=e.cliente_codigo
+        WHERE ABS(COALESCE(c.{sales_col},0)) < 0.000001
+        ORDER BY e.cantidad_edf DESC, cliente ASC
+    """
+    period_label = "último mes completo" if use_full_month else "último período disponible en Repago"
+    return {
+        "action": "query",
+        "title": f"Clientes de Repago con venta 0 · {business_label}",
+        "sql": sql,
+        "assumption": (
+            f"Universo: clientes con EDF en estado PDV de {business_label}. "
+            f"Venta considerada: {business_label} en el {period_label}. "
+            "Venta 0 significa exactamente 0,00 HL en el snapshot de Repago."
+        ),
+        "clarifying_question": "",
+        "reason": "",
+        "intent": "repago_zero_sales",
+        "repago_business": business_label,
+    }
+
+
+def _previous_analyst_question(context: dict[str, Any] | None = None) -> str:
+    ctx = context or {}
+    for key in ("_analyst_previous_question", "previous_question", "last_question", "last_user_question"):
+        value = str(ctx.get(key) or "").strip()
+        if value:
+            return value
+    return str(_LAST_ANALYST_TURN.get("question") or "").strip()
+
+
+def _repago_zero_sales_followup_plan(q: str, context: dict[str, Any] | None = None) -> dict | None:
+    """Repara repreguntas de corrección como "esos no tienen venta 0"."""
+    qn = _norm(q)
+    correction = (
+        "venta" in qn
+        and any(k in qn for k in (
+            "esos no", "esas no", "no son esos", "no son esas", "esos tienen",
+            "esas tienen", "me trajiste", "me mostraste", "esta mal", "no esta bien"
+        ))
+    )
+    if not correction:
+        return None
+
+    previous = _norm(_previous_analyst_question(context))
+    if previous and "repago" in previous and _zero_sales_requested(previous):
+        plan = _repago_zero_sales_plan(previous, context)
+        if plan:
+            plan = dict(plan)
+            plan["title"] = "Corrección · " + str(plan.get("title") or "Clientes con venta 0")
+            return plan
+
+    # Si la aplicación conserva sólo el tema activo, al menos evita caer en la
+    # venta total y pide la precisión que falta.
+    active_topic = _norm((context or {}).get("active_topic") or "")
+    if "repago" in active_topic:
+        return {
+            "action": "clarify",
+            "title": "",
+            "sql": "",
+            "assumption": "",
+            "clarifying_question": "¿Te referís a los clientes de **Repago con venta 0 de Cerveza/CZA** de la consulta anterior?",
+            "reason": "repregunta de corrección sin detalle de negocio",
+        }
+    return None
+
 def _sales_edf_cross_plan(q: str, context: dict[str, Any] | None = None) -> dict | None:
     if not _is_current_sales_question(q) or not any(k in q for k in ("edf", "heladera", "heladeras", "equipos")):
         return None
@@ -1658,6 +1830,14 @@ def _local_plan(question: str, context: dict[str, Any] | None = None) -> dict:
             "clarifying_question":"¿Qué querés consultar?", "reason":"pregunta vacía",
         }
 
+    # Repago + venta 0 es un cruce específico del snapshot de Repago y debe
+    # resolverse antes que la venta CHESS del mes corriente. También se atienden
+    # primero las repreguntas de corrección ("esos no tienen venta 0").
+    for planner in (_repago_zero_sales_followup_plan, _repago_zero_sales_plan):
+        plan = planner(q, context)
+        if plan:
+            return plan
+
     # Cruces con venta mes actual tienen prioridad para que "este mes" nunca caiga
     # en el histórico mensual de Repago.
     for planner in (_sales_stock_cross_plan, _sales_edf_cross_plan, _sales_discount_cross_plan, _sales_no_activity_plan, _current_sales_plan):
@@ -1775,6 +1955,10 @@ FRIENDLY = {
     "hl_mes": "HL mes",
     "hl_cza": "HL CZA",
     "hl_ung": "HL UNG",
+    "hl_aguas": "HL Aguas",
+    "hl_rb": "HL Red Bull",
+    "periodo": "Período",
+    "cantidad_edf": "Cantidad EDF",
     "importe_neto": "Importe neto",
     "importe_final": "Importe final",
     "facturas": "Facturas",
@@ -1874,6 +2058,16 @@ def analyze_question(question: str, context: dict[str, Any] | None = None) -> An
         plan = _local_plan(question, context)
     except Exception as exc:
         return AnalystResult(False, "", [], {"reason": "local_planner_error", "error": str(exc)})
+
+    # Guardar el turno recién después de planificar: así una repregunta puede leer
+    # la consulta anterior. Si el contexto es persistente por sesión, queda aislado
+    # allí; el global funciona como fallback para el despliegue actual de un solo bot.
+    global _LAST_ANALYST_TURN
+    _LAST_ANALYST_TURN = {"question": str(question or ""), "plan": dict(plan or {})}
+    if isinstance(context, dict):
+        context["_analyst_previous_question"] = str(question or "")
+        if plan.get("intent"):
+            context["active_topic"] = str(plan.get("intent"))
 
     action = str(plan.get("action") or "").lower()
     if action == "clarify":
