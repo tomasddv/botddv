@@ -367,6 +367,22 @@ def analyst_status() -> dict[str, Any]:
     }
 
 
+def _is_purchase_date_question(q: str) -> bool:
+    """Detecta consultas que preguntan por la fecha/día de compra.
+
+    Ejemplos: "cuándo compró el cliente 891", "qué días compró el SKU 30645",
+    "cuándo fue la última compra". Se resuelve contra Venta mes actual (CHESS).
+    """
+    qn = _norm(q)
+    phrases = (
+        "cuando compro", "cuando fue la compra", "cuando fue la ultima compra",
+        "ultima compra", "fecha de compra", "fechas de compra",
+        "que dia compro", "que dias compro", "dia que compro", "dias que compro",
+        "ultima vez que compro", "cuando hizo la compra", "cuando hicieron la compra",
+    )
+    return any(phrase in qn for phrase in phrases)
+
+
 def should_analyze(question: str) -> bool:
     """Deriva al analista local preguntas de conjuntos, comparaciones, rankings y cruces."""
     q = _norm(question)
@@ -410,7 +426,8 @@ def should_analyze(question: str) -> bool:
         "venta 0", "venta cero", "sin venta", "sin ventas", "0 hl", "cero hl",
         "no vendio", "no vendieron", "no compro", "no compraron"
     ))
-    return current_sales or plural_or_set or comparative or aggregate or cross_source or correction_followup or zero_repago
+    purchase_date = _is_purchase_date_question(q)
+    return current_sales or plural_or_set or comparative or aggregate or cross_source or correction_followup or zero_repago or purchase_date
 
 
 def _extract_limit(q: str, default: int = 15) -> int:
@@ -697,6 +714,16 @@ def _match_sales_customer(q: str, context: dict[str, Any] | None = None) -> tupl
     if not rows:
         return None
     codes = {str(r.get("cliente_codigo") or "") for r in rows}
+
+    # Si la pregunta identifica explícitamente "cliente 891", ese número tiene
+    # prioridad aunque también exista como código de SKU.
+    explicit = re.search(r"\bcliente(?:\s+(?:nro|numero|num))?\s*[:#-]?\s*(\d{1,7})\b", q)
+    if explicit:
+        clean = explicit.group(1).lstrip("0") or "0"
+        if clean in codes:
+            name = next((str(r.get("nombre_fantasia") or r.get("cliente") or "") for r in rows if str(r.get("cliente_codigo") or "") == clean), "")
+            return clean, name
+
     for code in re.findall(r"(?<!\d)(\d{3,7})(?!\d)", q):
         clean = code.lstrip("0") or "0"
         if clean in codes:
@@ -734,8 +761,20 @@ def _match_sales_sku(q: str, context: dict[str, Any] | None = None) -> tuple[str
     if not rows:
         return None
     codes = {str(r.get("sku") or "") for r in rows}
+
+    explicit = re.search(r"\b(?:sku|producto|codigo|código)(?:\s+(?:nro|numero|num))?\s*[:#-]?\s*(\d{1,7})\b", q)
+    if explicit:
+        clean = explicit.group(1).lstrip("0") or "0"
+        if clean in codes:
+            name = next((str(r.get("producto") or "") for r in rows if str(r.get("sku") or "") == clean), "")
+            return clean, name
+
+    client_tag = re.search(r"\bcliente(?:\s+(?:nro|numero|num))?\s*[:#-]?\s*(\d{1,7})\b", q)
+    explicit_client_code = (client_tag.group(1).lstrip("0") or "0") if client_tag else ""
     for code in re.findall(r"(?<!\d)(\d{3,7})(?!\d)", q):
         clean = code.lstrip("0") or "0"
+        if clean == explicit_client_code:
+            continue
         if clean in codes:
             name = next((str(r.get("producto") or "") for r in rows if str(r.get("sku") or "") == clean), "")
             return clean, name
@@ -1440,6 +1479,51 @@ def _current_sales_plan(q: str, context: dict[str, Any] | None = None) -> dict |
     direction = "ASC" if low else "DESC"
     period_note = _sales_period_note()
 
+    # Consulta temporal de compra: "cuándo compró el cliente 891" o
+    # "cuándo compró 30645 el cliente 891". Devuelve días reales de compra
+    # dentro del mes corriente, no un resumen de identidad del cliente/SKU.
+    if _is_purchase_date_question(q):
+        cust = _match_sales_customer(q, context)
+        sku = _match_sales_sku(q, context)
+        if not cust and not sku:
+            return {
+                "action":"clarify", "title":"", "sql":"", "assumption":"",
+                "clarifying_question":"¿De qué **cliente** o **SKU** querés ver las fechas de compra?",
+                "reason":"falta cliente o SKU para consulta de fecha de compra",
+            }
+
+        title_parts = []
+        if cust:
+            title_parts.append(f"cliente {cust[0]}" + (f" · {cust[1]}" if cust[1] else ""))
+        if sku:
+            title_parts.append(f"SKU {sku[0]}" + (f" · {sku[1]}" if sku[1] else ""))
+
+        last_only = any(k in q for k in (
+            "ultima compra", "ultima vez que compro", "compra mas reciente",
+            "compra más reciente", "cuando fue la ultima",
+        ))
+        limit_sql = " LIMIT 1" if last_only else ""
+        title_prefix = "Última compra" if last_only else "Fechas de compra del mes"
+        sql = f"""
+            SELECT DATE(v.fecha) AS fecha,
+                   ROUND(SUM(v.hl),2) AS hl,
+                   ROUND(SUM(v.importe_neto),2) AS importe_neto,
+                   ROUND(SUM(v.facturas),0) AS facturas
+            FROM ventas_mes_actual v
+            {where}
+            GROUP BY DATE(v.fecha)
+            HAVING SUM(v.hl) > 0 OR SUM(v.importe_neto) > 0
+            ORDER BY DATE(v.fecha) DESC
+            {limit_sql}
+        """
+        return {
+            "action":"query",
+            "title": title_prefix + " · " + " · ".join(title_parts),
+            "sql": sql,
+            "assumption": period_note + " Se consideran días con venta neta positiva para el filtro solicitado.",
+            "clarifying_question":"", "reason":"",
+        }
+
     # Varias unidades de negocio pedidas explícitamente: detalle + TOTAL de las elegidas.
     # Ej.: "cuánto llevamos Marketplace, Aguas y Red Bull en pesos/HL".
     if len(requested_units) >= 2:
@@ -1962,6 +2046,7 @@ FRIENDLY = {
     "importe_neto": "Importe neto",
     "importe_final": "Importe final",
     "facturas": "Facturas",
+    "fecha": "Fecha",
     "sku": "SKU",
     "producto": "Producto",
     "vendedor": "Vendedor",
@@ -1987,7 +2072,11 @@ def _format_value(value: Any) -> str:
             return f"{int(round(value)):,}".replace(",", ".")
         txt = f"{value:,.2f}"
         return txt.replace(",", "X").replace(".", ",").replace("X", ".")
-    return str(value)
+    text = str(value)
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})(?:[ T].*)?", text)
+    if m:
+        return f"{m.group(3)}/{m.group(2)}/{m.group(1)}"
+    return text
 
 
 def _markdown_table(df: pd.DataFrame, limit: int = DISPLAY_ROWS) -> str:
