@@ -650,24 +650,44 @@ def _extract_freshness_months(q: str) -> list[str]:
     return out
 
 
+def _extract_freshness_states(q: str) -> list[str]:
+    """Extrae uno o varios estados pedidos en consultas de Frescura."""
+    qn = _norm(q)
+    states: list[str] = []
+    if re.search(r"\bcritic(?:o|os|a|as)\b", qn):
+        states.append("CRITICO")
+    if re.search(r"\baccion(?:ar|ables?|ado|ados|a|an)?\b", qn):
+        states.append("ACCIONAR")
+    if re.search(r"\bok\b", qn):
+        states.append("OK")
+    return states
+
+
 def _freshness_month_products_plan(q: str) -> dict | None:
-    """Lista todos los productos de Frescura que vencen en los meses pedidos."""
+    """Lista productos de Frescura por mes, pudiendo filtrar uno o varios estados."""
     if "frescura" not in q:
         return None
     months = _extract_freshness_months(q)
     if not months:
         return None
-    if not any(k in q for k in ("producto", "productos", "sku", "venc", "mes", "meses")):
+    if not any(k in q for k in ("producto", "productos", "sku", "venc", "mes", "meses", "crit", "accion", "ok")):
         return None
 
     loc = _location(q) or "TOTAL DDV"
+    states = _extract_freshness_states(q)
     month_sql = ", ".join(_sql_text(m) for m in months)
     month_label = " y ".join(months)
     loc_label = loc.title() if loc != "TOTAL DDV" else "Total DDV"
+    state_filter_sql = ""
+    state_label = ""
+    if states:
+        states_sql = ", ".join(_sql_text(s) for s in states)
+        state_filter_sql = f"\n              AND UPPER(estado) IN ({states_sql})"
+        state_label = " · " + " + ".join(states)
 
     return {
         "action": "query",
-        "title": f"Productos de Frescura · meses {month_label} · {loc_label}",
+        "title": f"Productos de Frescura · meses {month_label} · {loc_label}{state_label}",
         "sql": f"""
             SELECT codigo,
                    descripcion,
@@ -691,13 +711,21 @@ def _freshness_month_products_plan(q: str) -> dict | None:
             WHERE localidad={_sql_text(loc)}
               AND vencimiento IS NOT NULL
               AND length(vencimiento) >= 7
-              AND substr(vencimiento,6,2) IN ({month_sql})
+              AND substr(vencimiento,6,2) IN ({month_sql}){state_filter_sql}
             GROUP BY codigo, descripcion, substr(vencimiento,6,2)
-            ORDER BY substr(vencimiento,6,2), MIN(vencimiento), descripcion
+            ORDER BY
+                CASE
+                    WHEN MAX(CASE WHEN UPPER(estado)='CRITICO' THEN 3 WHEN UPPER(estado)='ACCIONAR' THEN 2 WHEN UPPER(estado)='OK' THEN 1 ELSE 0 END)=3 THEN 1
+                    WHEN MAX(CASE WHEN UPPER(estado)='CRITICO' THEN 3 WHEN UPPER(estado)='ACCIONAR' THEN 2 WHEN UPPER(estado)='OK' THEN 1 ELSE 0 END)=2 THEN 2
+                    ELSE 3
+                END,
+                riesgo_bultos DESC, MIN(vencimiento), descripcion
         """,
         "assumption": (
             f"Traigo todos los SKU del snapshot de Frescura con vencimiento en los meses {month_label}. "
-            f"Ámbito: {loc_label}. Si un SKU tiene más de un lote en el mismo mes, acumulo su stock y riesgo y muestro el vencimiento más próximo."
+            f"Ámbito: {loc_label}. "
+            + (f"Filtro de estado: {', '.join(states)}. " if states else "")
+            + "Si un SKU tiene más de un lote en el mismo mes, acumulo stock y riesgo sólo sobre los lotes que cumplen los filtros y muestro el vencimiento más próximo."
         ),
         "clarifying_question": "",
         "reason": "",
