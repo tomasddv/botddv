@@ -9,7 +9,7 @@ from typing import Any
 
 import pandas as pd
 
-from sources import frescura_source, grupos_source, repago_source, ventas_actual_source
+from sources import frescura_source, grupos_source, repago_source, ventas_actual_source, promotores_kpi_source
 
 MAX_RESULT_ROWS = 500
 DISPLAY_ROWS = 15
@@ -291,6 +291,14 @@ def _grupos_frames() -> dict[str, pd.DataFrame]:
 
 
 
+def _promotores_kpi_frames() -> dict[str, pd.DataFrame]:
+    snap = _safe_snap(promotores_kpi_source)
+    return {
+        "promotores_ruta": pd.DataFrame(snap.get("route_clients") or []),
+        "promotores_plan": pd.DataFrame(snap.get("plan_rows") or []),
+    }
+
+
 def _ventas_actual_frames() -> dict[str, pd.DataFrame]:
     snap = _safe_snap(ventas_actual_source)
     rows = snap.get("rows") or []
@@ -315,6 +323,7 @@ def _frames() -> dict[str, pd.DataFrame]:
     frames.update(_repago_frames())
     frames.update(_grupos_frames())
     frames.update(_ventas_actual_frames())
+    frames.update(_promotores_kpi_frames())
     return frames
 
 
@@ -330,6 +339,8 @@ EMPTY_SCHEMAS = {
     "ventas_mes_actual": ["fecha", "cliente_codigo", "cliente", "razon_social", "nombre_fantasia", "agrupacion", "localidad_base", "lista_precios", "subcanal", "vendedor_codigo", "vendedor", "supervisor", "ruta", "sku", "producto", "marca", "marca_unificada", "segmento", "segmento_2", "segmento_3", "calibre", "calibre_unificado", "division", "producto_estadistico", "unidad_negocio", "ung_top", "calibres_cpr", "foco_comercial", "es_cza", "es_core", "es_value", "es_above_core", "es_premium", "es_balanced", "es_nabs", "es_laton_710", "hl", "importe_neto", "importe_final", "facturas"],
     "ventas_mes_actual_meta": ["period_start", "period_end", "period_month", "updated_at", "total_hl", "clientes", "skus"],
     "maestro_clientes_actual": ["cliente_codigo", "razon_social", "nombre_fantasia", "agrupacion", "localidad_base", "lista_precios", "subcanal", "ramo_cliente"],
+    "promotores_ruta": ["vendedor_codigo", "promotor", "supervisor", "ruta", "cliente_codigo", "cliente", "dia", "grupo_ruta", "alta_fecha"],
+    "promotores_plan": ["fecha", "ruta", "kpi", "promotor", "supervisor", "planificado"],
 }
 
 
@@ -1623,15 +1634,27 @@ def _sales_discount_cross_plan(q: str, context: dict[str, Any] | None = None) ->
 
 
 def _promoter_values() -> list[str]:
-    """Lista de promotores del snapshot de Grupo de clientes."""
-    snap = _safe_snap(grupos_source)
+    """Promotores conocidos por Grupo de clientes, Venta diaria y dashboard KPI."""
     values: dict[str, str] = {}
+    snap = _safe_snap(grupos_source)
     for rows in (snap.get("rows_by_customer") or {}).values():
         for row in rows or []:
             raw = str(row.get("promotor") or "").strip()
             key = _norm(raw)
             if raw and key:
                 values.setdefault(key, raw)
+    sales = _safe_snap(ventas_actual_source)
+    for row in sales.get("rows") or []:
+        raw = str(row.get("vendedor") or "").strip()
+        key = _norm(raw)
+        if raw and key and not raw.upper().startswith("VND "):
+            values.setdefault(key, raw)
+    kpi = _safe_snap(promotores_kpi_source)
+    for row in kpi.get("route_clients") or []:
+        raw = str(row.get("promotor") or "").strip()
+        key = _norm(raw)
+        if raw and key and not raw.upper().startswith("VND "):
+            values.setdefault(key, raw)
     return sorted(values.values(), key=lambda x: _norm(x))
 
 
@@ -1649,19 +1672,38 @@ def _requested_promoters(q: str) -> list[str]:
 
 
 def _promoter_mapping_cte(q: str) -> tuple[str, list[str]]:
-    """CTE de asignación cliente↔promotor, deduplicada por cliente/promotor."""
+    """Asignación cliente↔promotor.
+
+    Prioriza el maestro de rutas del dashboard Promotores y usa Grupo de clientes
+    como respaldo para clientes que todavía no estén en ese maestro.
+    """
     requested = _requested_promoters(q)
-    conditions = ["TRIM(COALESCE(promotor,''))<>''"]
+    route_conditions = ["TRIM(COALESCE(promotor,''))<>''"]
+    group_conditions = ["TRIM(COALESCE(promotor,''))<>''"]
     if requested:
         values = ",".join(_sql_text(x.upper()) for x in requested)
-        conditions.append(f"UPPER(promotor) IN ({values})")
-    where = " AND ".join(conditions)
+        route_conditions.append(f"UPPER(promotor) IN ({values})")
+        group_conditions.append(f"UPPER(promotor) IN ({values})")
+    rw = " AND ".join(route_conditions)
+    gw = " AND ".join(group_conditions)
     cte = f"""
-        pm AS (
-            SELECT cliente_codigo, MAX(cliente) AS cliente, promotor
-            FROM descuentos_cliente
-            WHERE {where}
+        pm_route AS (
+            SELECT cliente_codigo, MAX(cliente) AS cliente, promotor, MAX(supervisor) AS supervisor
+            FROM promotores_ruta
+            WHERE {rw}
             GROUP BY cliente_codigo, promotor
+        ),
+        pm_group AS (
+            SELECT d.cliente_codigo, MAX(d.cliente) AS cliente, d.promotor, '' AS supervisor
+            FROM descuentos_cliente d
+            WHERE {gw}
+              AND NOT EXISTS (SELECT 1 FROM pm_route r WHERE r.cliente_codigo=d.cliente_codigo)
+            GROUP BY d.cliente_codigo, d.promotor
+        ),
+        pm AS (
+            SELECT * FROM pm_route
+            UNION ALL
+            SELECT * FROM pm_group
         )
     """
     return cte, requested
@@ -1711,6 +1753,264 @@ def _promoter_sales_where(q: str, context: dict[str, Any] | None = None, alias: 
         notes.append(time_label)
 
     return ("WHERE " + " AND ".join(filters)) if filters else "", notes
+
+
+def _promoter_route_group(q: str) -> str | None:
+    qn = _norm(q).upper()
+    for group in ("LUJU", "MAVI", "MISA"):
+        if group in qn:
+            return group
+    return None
+
+
+def _promoter_supervisor(q: str) -> str | None:
+    qn = _norm(q)
+    if "bruno" in qn or "ismael" in qn:
+        return "ISMAEL BRUNO"
+    if "hernan" in qn or "casco" in qn:
+        return "CASCO HERNAN"
+    return None
+
+
+def _dashboard_focus(q: str) -> tuple[str, str]:
+    cond, label = _sales_focus_condition(q, "v")
+    if cond:
+        return cond, label
+    qn = _norm(q)
+    if "eficiencia" in qn:
+        return "", "Eficiencia de ventas"
+    return "", ""
+
+
+def _promoter_dashboard_plan(q: str, context: dict[str, Any] | None = None) -> dict | None:
+    """KPIs del repo promotores_kpi_dashboard sobre las fuentes vivas del bot.
+
+    Incorpora clientes de ruta, planificación, CCC, TBD, restantes, cumplimiento,
+    no compradores, focos comerciales, supervisor y grupo de ruta. Puede sumar
+    Repago/EDF al mismo resumen cuando la consulta lo pide.
+    """
+    qn = _norm(q)
+    dashboard_terms = any(k in qn for k in (
+        "ccc", "tbd", "clientes ruta", "clientes de ruta", "cliente ruta",
+        "planificado", "planificacion", "planificación", "cumplimiento",
+        "restantes", "no compradores", "sin compra", "kpi", "foco",
+        "luju", "mavi", "misa", "activaciones", "activacion"
+    ))
+    if not dashboard_terms:
+        return None
+    if not any(k in qn for k in ("promotor", "promotores", "supervisor", "ccc", "tbd", "kpi")) and not _requested_promoters(qn):
+        return None
+
+    requested = _requested_promoters(qn)
+    supervisor = _promoter_supervisor(qn)
+    route_group = _promoter_route_group(qn)
+    focus_cond, focus_label = _dashboard_focus(qn)
+    wants_repago = any(k in qn for k in ("repago", "edf", "heladera", "equipo"))
+    wants_plan = any(k in qn for k in ("planificado", "planificacion", "planificación", "cumplimiento", "restantes"))
+    wants_tbd = "tbd" in qn or "sku por cliente" in qn or "skus por cliente" in qn
+    wants_route_clients = any(k in qn for k in ("clientes ruta", "clientes de ruta", "cliente ruta", "restantes", "no compradores", "sin compra", "cumplimiento"))
+    wants_nonbuyers = any(k in qn for k in ("no compradores", "sin compra", "no compraron", "no compro"))
+    wants_ccc = "ccc" in qn or "activacion" in qn or "activaciones" in qn or "cumplimiento" in qn or "restantes" in qn
+
+    promoter_filter = ""
+    if requested:
+        vals = ",".join(_sql_text(x.upper()) for x in requested)
+        promoter_filter = f" AND UPPER(promotor) IN ({vals})"
+    supervisor_filter = f" AND UPPER(supervisor)={_sql_text(supervisor)}" if supervisor else ""
+    route_filter = f" AND UPPER(grupo_ruta)={_sql_text(route_group)}" if route_group else ""
+
+    route_cte = f"""
+        ruta_base AS (
+            SELECT cliente_codigo, MAX(cliente) AS cliente, promotor, MAX(supervisor) AS supervisor,
+                   MAX(ruta) AS ruta
+            FROM promotores_ruta
+            WHERE TRIM(COALESCE(promotor,''))<>''{promoter_filter}{supervisor_filter}{route_filter}
+            GROUP BY cliente_codigo, promotor
+        )
+    """
+
+    # Si el snapshot de rutas aún no llegó, no inventamos planificación/ruta.
+    kpi_snap = _safe_snap(promotores_kpi_source)
+    has_routes = bool(kpi_snap.get("route_clients"))
+    has_plan = bool(kpi_snap.get("plan_rows"))
+    if (wants_route_clients or wants_plan) and not has_routes:
+        return {
+            "action":"unavailable", "title":"", "sql":"", "assumption":"", "clarifying_question":"",
+            "reason":"La fuente **Promotores KPI** todavía no tiene el maestro de rutas cargado. Se actualizará automáticamente desde RUTAS / reporte de clientes.",
+        }
+
+    # Filtros de venta. Para promotores KPI el promotor se toma del maestro de ruta,
+    # no de una búsqueda textual sobre vendedor.
+    sales_filters = []
+    if focus_cond:
+        sales_filters.append(focus_cond)
+    time_cond, time_note = _sales_time_condition(qn, "v")
+    if time_cond:
+        sales_filters.append(time_cond)
+    loc = _location(qn)
+    if loc in {"TRELEW", "MADRYN"}:
+        sales_filters.append(f"UPPER(v.localidad_base)={_sql_text(loc)}")
+    sales_where = ("WHERE " + " AND ".join(sales_filters)) if sales_filters else ""
+
+    # Sólo consulta planificación registrada.
+    if wants_plan and not any(k in qn for k in ("cumplimiento", "restantes", "real", "ccc", "tbd", "venta", "compra", "repago")):
+        if not has_plan:
+            return {"action":"unavailable", "title":"", "sql":"", "assumption":"", "clarifying_question":"", "reason":"La hoja **BD_KPI_PROMOTORES** todavía no tiene datos disponibles en el snapshot."}
+        plan_filters = ["1=1"]
+        if requested:
+            vals = ",".join(_sql_text(x.upper()) for x in requested)
+            plan_filters.append(f"UPPER(promotor) IN ({vals})")
+        if supervisor:
+            plan_filters.append(f"UPPER(supervisor)={_sql_text(supervisor)}")
+        if route_group:
+            plan_filters.append(f"UPPER(ruta)={_sql_text(route_group)}")
+        if focus_label:
+            plan_filters.append(f"UPPER(kpi)={_sql_text(focus_label.upper())}")
+        period = str(_sales_snap().get("period_month") or "")
+        if period:
+            plan_filters.append(f"SUBSTR(fecha,1,7)={_sql_text(period)}")
+        sql = f"""
+            SELECT promotor, supervisor, kpi,
+                   ROUND(SUM(planificado),0) AS planificado
+            FROM promotores_plan
+            WHERE {' AND '.join(plan_filters)}
+            GROUP BY promotor, supervisor, kpi
+            ORDER BY promotor, kpi
+            LIMIT {MAX_RESULT_ROWS}
+        """
+        return {"action":"query", "title":"Planificación KPI por promotor", "sql":sql,
+                "assumption":"Planificación tomada de BD_KPI_PROMOTORES del dashboard de Promotores.", "clarifying_question":"", "reason":"", "intent":"promotores_kpi_plan", "display_all": True}
+
+    # Para cumplimiento hace falta saber contra qué foco/KPI comparar el plan.
+    if "cumplimiento" in qn and not focus_label:
+        return {"action":"clarify", "title":"", "sql":"", "assumption":"",
+                "clarifying_question":"¿De qué KPI querés el cumplimiento: **Total CZA, Core, Value, Above Core, Premium, Latones 710, Balanced Choices o Nabs**?", "reason":"falta KPI/foco"}
+
+    metric_focus = focus_label or "Total venta"
+    period_note = _sales_period_note()
+
+    # Base de compra por cliente/promotor para CCC/TBD/restantes/no compradores.
+    buyer_cte = f"""
+        venta_cliente AS (
+            SELECT rb.promotor, MAX(rb.supervisor) AS supervisor, v.cliente_codigo,
+                   COUNT(DISTINCT v.sku) AS skus_comprados,
+                   SUM(v.hl) AS hl, SUM(v.importe_neto) AS importe_neto
+            FROM ruta_base rb
+            JOIN ventas_mes_actual v ON v.cliente_codigo=rb.cliente_codigo
+            {sales_where}
+            GROUP BY rb.promotor, v.cliente_codigo
+            HAVING ABS(SUM(v.hl))>0.0000001 OR ABS(SUM(v.importe_neto))>0.0000001
+        ),
+        venta_promotor AS (
+            SELECT promotor, MAX(supervisor) AS supervisor,
+                   COUNT(DISTINCT cliente_codigo) AS ccc,
+                   SUM(skus_comprados) AS tbd,
+                   ROUND(1.0 * SUM(skus_comprados) / NULLIF(COUNT(DISTINCT cliente_codigo),0),2) AS tbd_por_cliente,
+                   ROUND(SUM(hl),2) AS hl,
+                   ROUND(SUM(importe_neto),2) AS importe_neto
+            FROM venta_cliente
+            GROUP BY promotor
+        ),
+        ruta_promotor AS (
+            SELECT promotor, MAX(supervisor) AS supervisor,
+                   COUNT(DISTINCT cliente_codigo) AS clientes_ruta
+            FROM ruta_base
+            GROUP BY promotor
+        )
+    """
+
+    # No compradores: detalle de clientes, no sólo resumen.
+    if wants_nonbuyers:
+        sql = f"""
+            WITH {route_cte.strip()},
+            {buyer_cte.strip()}
+            SELECT rb.promotor, rb.supervisor, rb.cliente_codigo, rb.cliente, rb.ruta
+            FROM ruta_base rb
+            LEFT JOIN venta_cliente vc ON vc.promotor=rb.promotor AND vc.cliente_codigo=rb.cliente_codigo
+            WHERE vc.cliente_codigo IS NULL
+            ORDER BY rb.promotor, rb.cliente
+            LIMIT {MAX_RESULT_ROWS}
+        """
+        assumption = period_note + f" Foco: {metric_focus}. Universo de clientes tomado del maestro de rutas del dashboard Promotores."
+        return {"action":"query", "title":"Clientes no compradores por promotor", "sql":sql,
+                "assumption":assumption, "clarifying_question":"", "reason":"", "intent":"promotores_kpi_no_compradores", "display_all": True}
+
+    # Plan mensual, si corresponde.
+    plan_cte = ""
+    plan_join = ""
+    plan_cols = ""
+    if wants_plan and has_plan:
+        plan_filters = []
+        period = str(_sales_snap().get("period_month") or "")
+        if period:
+            plan_filters.append(f"SUBSTR(fecha,1,7)={_sql_text(period)}")
+        if focus_label:
+            plan_filters.append(f"UPPER(kpi)={_sql_text(focus_label.upper())}")
+        if route_group:
+            plan_filters.append(f"UPPER(ruta)={_sql_text(route_group)}")
+        pw = "WHERE " + " AND ".join(plan_filters) if plan_filters else ""
+        plan_cte = f""",
+        plan_promotor AS (
+            SELECT promotor, ROUND(SUM(planificado),0) AS planificado
+            FROM promotores_plan
+            {pw}
+            GROUP BY promotor
+        )"""
+        plan_join = "LEFT JOIN plan_promotor pp ON pp.promotor=rp.promotor"
+        plan_cols = ", COALESCE(pp.planificado,0) AS planificado, COALESCE(vp.ccc,0) AS real, ROUND(100.0*COALESCE(vp.ccc,0)/NULLIF(COALESCE(pp.planificado,0),0),1) AS cumplimiento_pct"
+
+    rep_cte = ""
+    rep_join = ""
+    rep_cols = ""
+    if wants_repago:
+        rep_field = _repago_field(qn)
+        rep_cte = f""",
+        rep_promotor AS (
+            SELECT rb.promotor,
+                   COUNT(DISTINCT r.cliente_codigo) AS clientes_con_edf,
+                   COUNT(*) AS cantidad_edf,
+                   ROUND(AVG(r.{rep_field}),1) AS repago_promedio_pct,
+                   ROUND(SUM(r.objetivo_hl),2) AS objetivo_hl
+            FROM ruta_base rb
+            JOIN repago_edf r ON r.cliente_codigo=rb.cliente_codigo
+            WHERE UPPER(r.estado)='PDV'
+            GROUP BY rb.promotor
+        )"""
+        rep_join = "LEFT JOIN rep_promotor rep ON rep.promotor=rp.promotor"
+        rep_cols = ", COALESCE(rep.clientes_con_edf,0) AS clientes_con_edf, COALESCE(rep.cantidad_edf,0) AS cantidad_edf, rep.repago_promedio_pct, COALESCE(rep.objetivo_hl,0) AS objetivo_hl"
+
+    sql = f"""
+        WITH {route_cte.strip()},
+        {buyer_cte.strip()}
+        {plan_cte}
+        {rep_cte}
+        SELECT rp.promotor, rp.supervisor,
+               rp.clientes_ruta,
+               COALESCE(vp.ccc,0) AS ccc,
+               MAX(rp.clientes_ruta-COALESCE(vp.ccc,0),0) AS clientes_restantes,
+               COALESCE(vp.tbd,0) AS tbd,
+               COALESCE(vp.tbd_por_cliente,0) AS tbd_por_cliente,
+               COALESCE(vp.hl,0) AS hl,
+               COALESCE(vp.importe_neto,0) AS importe_neto
+               {plan_cols}
+               {rep_cols}
+        FROM ruta_promotor rp
+        LEFT JOIN venta_promotor vp ON vp.promotor=rp.promotor
+        {plan_join}
+        {rep_join}
+        ORDER BY COALESCE(vp.ccc,0) DESC, rp.promotor
+        LIMIT {MAX_RESULT_ROWS}
+    """
+    title = "KPIs de promotores"
+    if focus_label:
+        title += f" · {focus_label}"
+    assumption = period_note + f" Foco: {metric_focus}. Clientes ruta y planificación provienen del dashboard Promotores; venta real proviene de CHESS."
+    if route_group:
+        assumption += f" Grupo de ruta: {route_group}."
+    if wants_repago:
+        assumption += " Repago calculado sobre EDF en PDV."
+    return {"action":"query", "title":title, "sql":sql, "assumption":assumption,
+            "clarifying_question":"", "reason":"", "intent":"promotores_kpi", "display_all": True}
 
 
 def _promoter_repago_threshold(q: str) -> tuple[str, str]:
@@ -2531,6 +2831,11 @@ def _local_plan(question: str, context: dict[str, Any] | None = None) -> dict:
     if plan:
         return plan
 
+    # Reglas y KPIs importados del dashboard Promotores (CCC, TBD, planificación, rutas).
+    plan = _promoter_dashboard_plan(q, context)
+    if plan:
+        return plan
+
     # Promotor vive en Grupo de clientes y puede cruzarse con Venta CHESS y Repago.
     # Debe resolverse antes que el motor de venta genérico para no confundir
     # "promotor" con vendedor ni intentar buscarlo como nombre de cliente.
@@ -2682,6 +2987,17 @@ FRIENDLY = {
     "activacion_pct": "Activación %",
     "clientes_con_edf": "Clientes con EDF",
     "clientes_asignados": "Clientes asignados",
+    "clientes_ruta": "Clientes ruta",
+    "clientes_restantes": "Restantes",
+    "ccc": "CCC",
+    "tbd": "TBD",
+    "tbd_por_cliente": "TBD / cliente",
+    "planificado": "Planificado",
+    "real": "Real",
+    "cumplimiento_pct": "Cumplimiento %",
+    "grupo_ruta": "Grupo ruta",
+    "kpi": "KPI",
+    "ruta": "Ruta",
     "repago_promedio_pct": "Repago promedio %",
     "objetivo_hl": "Objetivo HL",
     "negocio": "Negocio",

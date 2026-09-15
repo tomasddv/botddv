@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 from typing import Any
 
-from sources import repago_source, frescura_source, grupos_source, planificacion_source, ventas_actual_source
+from sources import repago_source, frescura_source, grupos_source, planificacion_source, ventas_actual_source, promotores_kpi_source
 
 _INTERVAL_MINUTES = max(5, int(os.getenv("AUTO_REFRESH_MINUTES", "30") or 30))
 _INTERVAL_SECONDS = _INTERVAL_MINUTES * 60
@@ -33,6 +33,7 @@ _SOURCES = (
     ("Grupo de clientes", grupos_source),
     ("Topes Planificación", planificacion_source),
     ("Venta mes actual", ventas_actual_source),
+    ("Promotores KPI", promotores_kpi_source),
 )
 
 
