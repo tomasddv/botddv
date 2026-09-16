@@ -16,7 +16,7 @@ import pandas as pd
 
 from sources import frescura_source, grupos_source, repago_source, ventas_actual_source, promotores_kpi_source, topes_repo_source
 
-ENGINE_VERSION = "14.3"
+ENGINE_VERSION = "14.4"
 
 MAX_RESULT_ROWS = 500
 DISPLAY_ROWS = 15
@@ -553,6 +553,23 @@ def _is_purchase_amount_question(q: str) -> bool:
     ))
 
 
+def _looks_like_word(question: str, target: str, cutoff: float = 0.78) -> bool:
+    """Reconoce errores de tipeo cortos en palabras de intención, no en datos.
+
+    Se usa únicamente para decidir el enrutamiento/intención (por ejemplo
+    ``clietnes`` -> ``clientes``). Nunca se usa para inventar códigos, marcas o
+    nombres: las entidades comerciales siguen resolviéndose contra los catálogos
+    reales del snapshot.
+    """
+    target_n = _norm(target)
+    for token in re.findall(r"[a-z0-9]+", _norm(question)):
+        if len(token) < 4:
+            continue
+        if token == target_n or difflib.SequenceMatcher(None, token, target_n).ratio() >= cutoff:
+            return True
+    return False
+
+
 def should_analyze(question: str) -> bool:
     """Deriva al analista local preguntas de conjuntos, comparaciones, rankings y cruces."""
     q = _norm(question)
@@ -604,7 +621,24 @@ def should_analyze(question: str) -> bool:
         and ("mes" in q or bool(_extract_freshness_months(q)))
         and any(k in q for k in ("producto", "productos", "sku", "venc", "frescura"))
     )
-    promoter_analytics = "promotor" in q or "promotores" in q or bool(_requested_promoters(q))
+    # Nombres de supervisor/promotor y focos comerciales deben entrar al analista
+    # antes que el motor rápido de cliente. Esto evita interpretar, por ejemplo,
+    # ``Latones 710 Bruno Ismael`` como si 710 fuera el código de un cliente.
+    supervisor_analytics = bool(_promoter_supervisor(q))
+    promoter_analytics = (
+        "promotor" in q or "promotores" in q
+        or bool(_requested_promoters(q))
+        or supervisor_analytics
+    )
+    fuzzy_client_aggregate = (
+        ("cuant" in q or "cantidad" in q)
+        and _looks_like_word(q, "clientes")
+        and any(k in q for k in ("compra", "compr", "venta", "vend", "repago", "tope", "stock"))
+    )
+    commercial_focus_analytics = (
+        _is_laton_710_query(q)
+        and any(k in q for k in ("cuant", "cantidad", "cliente", "compra", "venta", "vend", "promotor"))
+    )
 
     # Repreguntas cortas y elípticas deben pasar por el analista antes que las
     # reglas rápidas. El significado real se resuelve después con el contexto
@@ -624,7 +658,12 @@ def should_analyze(question: str) -> bool:
             "segundo tope", "segundo tramo",
         ))
     )
-    return current_sales or plural_or_set or comparative or aggregate or cross_source or correction_followup or zero_repago or purchase_date or purchase_contents or purchase_amount or freshness_month_list or promoter_analytics or contextual_followup
+    return (
+        current_sales or plural_or_set or comparative or aggregate or cross_source
+        or correction_followup or zero_repago or purchase_date or purchase_contents
+        or purchase_amount or freshness_month_list or promoter_analytics
+        or fuzzy_client_aggregate or commercial_focus_analytics or contextual_followup
+    )
 
 
 def _extract_limit(q: str, default: int = 15) -> int:
@@ -1026,6 +1065,40 @@ def _sales_codes(field: str) -> set[str]:
     return {str(r.get(field) or "") for r in _sales_rows() if str(r.get(field) or "")}
 
 
+def _protected_sales_numeric_tokens(q: str) -> set[str]:
+    """Números que en la frase cumplen un rol comercial y no son códigos.
+
+    Un número de 3/4 dígitos puede coincidir accidentalmente con un cliente o SKU
+    real. Ejemplos típicos: Latones 710, calibre 473, 330 cc, 500 ml, año 2026.
+    Estos tokens quedan protegidos salvo que el usuario los etiquete
+    explícitamente como ``cliente`` o ``SKU/producto``.
+    """
+    qn = _norm(q)
+    protected: set[str] = set()
+
+    # Presentaciones/calibres/envases.
+    commercial_patterns = (
+        r"\b(?:laton|latones|lata|latas|calibre|calibres|envase|envases|presentacion|presentaciones)\b[^0-9]{0,14}(\d{2,4})(?:\s*(?:cc|ml))?\b",
+        r"\b(\d{2,4})\s*(?:cc|ml)\b",
+    )
+    for pattern in commercial_patterns:
+        for m in re.finditer(pattern, qn):
+            protected.add((m.group(1).lstrip("0") or "0"))
+
+    # El KPI del tablero se denomina Latones 710; también se acepta "latones"
+    # a secas, pero si aparece 710 queda inequívocamente protegido.
+    if re.search(r"\b(?:laton|latones)\b", qn) and re.search(r"(?<!\d)710(?!\d)", qn):
+        protected.add("710")
+
+    # Años y porcentajes no son códigos de entidad.
+    for m in re.finditer(r"\b(20\d{2})\b", qn):
+        protected.add(m.group(1))
+    for m in re.finditer(r"(?<!\d)(\d{1,3})(?:[.,]\d+)?\s*%", qn):
+        protected.add(m.group(1).lstrip("0") or "0")
+
+    return protected
+
+
 def _match_sales_customer(q: str, context: dict[str, Any] | None = None) -> tuple[str, str] | None:
     rows = _sales_rows()
     if not rows:
@@ -1041,8 +1114,16 @@ def _match_sales_customer(q: str, context: dict[str, Any] | None = None) -> tupl
             name = next((str(r.get("nombre_fantasia") or r.get("cliente") or "") for r in rows if str(r.get("cliente_codigo") or "") == clean), "")
             return clean, name
 
+    protected_numbers = _protected_sales_numeric_tokens(q)
+    # Números etiquetados como SKU/producto tampoco pueden convertirse en cliente.
+    sku_tagged = {
+        (x.lstrip("0") or "0")
+        for x in re.findall(r"\b(?:sku|producto|codigo|código)(?:\s+(?:nro|numero|num))?\s*[:#-]?\s*(\d{1,7})\b", q)
+    }
     for code in re.findall(r"(?<!\d)(\d{3,7})(?!\d)", q):
         clean = code.lstrip("0") or "0"
+        if clean in protected_numbers or clean in sku_tagged:
+            continue
         if clean in codes:
             name = next((str(r.get("nombre_fantasia") or r.get("cliente") or "") for r in rows if str(r.get("cliente_codigo") or "") == clean), "")
             return clean, name
@@ -1088,9 +1169,10 @@ def _match_sales_sku(q: str, context: dict[str, Any] | None = None) -> tuple[str
 
     client_tag = re.search(r"\bcliente(?:\s+(?:nro|numero|num))?\s*[:#-]?\s*(\d{1,7})\b", q)
     explicit_client_code = (client_tag.group(1).lstrip("0") or "0") if client_tag else ""
+    protected_numbers = _protected_sales_numeric_tokens(q)
     for code in re.findall(r"(?<!\d)(\d{3,7})(?!\d)", q):
         clean = code.lstrip("0") or "0"
-        if clean == explicit_client_code:
+        if clean == explicit_client_code or clean in protected_numbers:
             continue
         if clean in codes:
             name = next((str(r.get("producto") or "") for r in rows if str(r.get("sku") or "") == clean), "")
@@ -2973,7 +3055,10 @@ def _promoter_analytics_plan(q: str, context: dict[str, Any] | None = None) -> d
         "detalle de clientes", "listame los clientes", "lista de clientes", "que clientes", "cuales clientes"
     ))
 
-    asks_count = any(k in qn for k in ("cuantos clientes", "cuántos clientes", "cantidad de clientes", "clientes con compra"))
+    asks_count = (
+        any(k in qn for k in ("cuantos clientes", "cuántos clientes", "cantidad de clientes", "clientes con compra"))
+        or (("cuant" in qn or "cantidad" in qn) and _looks_like_word(qn, "clientes"))
+    )
     wants_hl, wants_money, wants_invoices = _requested_sales_metrics(qn)
     # En analítica por promotor, si no pide una métrica concreta mostramos HL y $ por defecto.
     if wants_sales and not any((wants_hl, wants_money, wants_invoices)):
