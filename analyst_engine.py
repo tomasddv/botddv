@@ -1127,23 +1127,58 @@ _GENERIC_DIMENSION_PRIORITY = (
 def _generic_sales_dimension_condition(q: str, alias: str = "v") -> tuple[str, str]:
     """Reconoce valores comerciales aunque el usuario no nombre la dimensión.
 
-    Ej.: "cuánta venta en $ tiene marketplace" -> unidad_negocio contiene MARKETPLACE.
+    Prioriza frases comerciales completas antes de tokens sueltos. Esto evita
+    falsos positivos como ``PURE GOLD`` -> ``NESTLE PUREZA VITAL``: la frase
+    ``pure gold`` debe coincidir como palabras completas en un valor real del
+    snapshot. Cuando se usa un único token, también se exige palabra completa
+    y el SQL se limita a los valores reales encontrados en vez de usar un
+    ``LIKE '%TOKEN%'`` demasiado amplio.
     """
     rows = _sales_rows()
     if not rows:
         return "", ""
 
+    qn = _norm(q)
+    p = alias + "." if alias else ""
+
+    # Palabras significativas para el fallback de un solo término.
     tokens = [
-        t for t in re.findall(r"[a-z0-9]+", _norm(q))
+        t for t in re.findall(r"[a-z0-9]+", qn)
         if len(t) >= 4 and t not in _GENERIC_SALES_STOPWORDS and not t.isdigit()
     ]
-    tokens = sorted(dict.fromkeys(tokens), key=lambda x: (-len(x), x))
-    if not tokens:
-        return "", ""
+    tokens = list(dict.fromkeys(tokens))
 
-    p = alias + "." if alias else ""
-    for field, label in _GENERIC_DIMENSION_PRIORITY:
-        values = {}
+    # Runs contiguos de palabras significativas. Las palabras de control cortan
+    # la frase; así en "pure gold tiene gaston fabre" obtenemos por separado
+    # "pure gold" y "gaston fabre".
+    raw_words = re.findall(r"[a-z0-9]+", qn)
+    runs: list[list[str]] = []
+    current: list[str] = []
+    for word in raw_words:
+        if word in _GENERIC_SALES_STOPWORDS or word.isdigit() or len(word) < 3:
+            if current:
+                runs.append(current)
+                current = []
+            continue
+        current.append(word)
+    if current:
+        runs.append(current)
+
+    phrase_candidates: list[str] = []
+    for run in runs:
+        if len(run) < 2:
+            continue
+        # Frases más largas primero. Limitar a 5 palabras evita capturar
+        # oraciones completas y alcanza para marcas/productos comerciales.
+        max_n = min(5, len(run))
+        for n in range(max_n, 1, -1):
+            for i in range(0, len(run) - n + 1):
+                phrase = " ".join(run[i:i+n])
+                if phrase not in phrase_candidates:
+                    phrase_candidates.append(phrase)
+
+    def field_values(field: str) -> dict[str, str]:
+        values: dict[str, str] = {}
         for row in rows:
             raw = str(row.get(field) or "").strip()
             if not raw:
@@ -1151,20 +1186,60 @@ def _generic_sales_dimension_condition(q: str, alias: str = "v") -> tuple[str, s
             n = _norm(raw)
             if n:
                 values[n] = raw
+        return values
+
+    def exact_values_condition(field: str, matched: list[str]) -> str:
+        unique: list[str] = []
+        seen: set[str] = set()
+        for raw in matched:
+            key = _norm(raw)
+            if key and key not in seen:
+                unique.append(raw)
+                seen.add(key)
+        quoted = ",".join(_sql_text(v.upper()) for v in unique)
+        return f"UPPER({p}{field}) IN ({quoted})"
+
+    for field, label in _GENERIC_DIMENSION_PRIORITY:
+        values = field_values(field)
         if not values:
             continue
 
-        for token in tokens:
-            matched = [raw for n, raw in values.items() if re.search(rf"(^|\b){re.escape(token)}", n)]
+        # 1) Valor real completo escrito literalmente en la pregunta.
+        literal = [
+            raw for n, raw in values.items()
+            if n and re.search(rf"(?<!\w){re.escape(n)}(?!\w)", qn)
+        ]
+        if literal:
+            detail = ", ".join(sorted(set(literal))[:3])
+            if len(set(literal)) > 3:
+                detail += ", …"
+            return exact_values_condition(field, literal), f"{label}: {detail}"
+
+        # 2) Frase parcial de 2+ palabras, pero con límites de palabra exactos.
+        #    Ej. PURE GOLD coincide con STELLA ARTOIS PURE GOLD, pero no con
+        #    NESTLE PUREZA VITAL porque PURE != PUREZA y además falta GOLD.
+        for phrase in phrase_candidates:
+            rx = re.compile(rf"(?<!\w){re.escape(phrase)}(?!\w)")
+            matched = [raw for n, raw in values.items() if rx.search(n)]
             if not matched:
                 continue
-            escaped = token.replace("'", "''").upper()
-            condition = f"UPPER({p}{field}) LIKE '%{escaped}%'"
-            sample = sorted(set(matched))[:3]
-            detail = ", ".join(sample)
+            detail = ", ".join(sorted(set(matched))[:3])
             if len(set(matched)) > 3:
                 detail += ", …"
-            return condition, f"{label}: {detail}"
+            return exact_values_condition(field, matched), f"{label}: {detail}"
+
+        # 3) Un solo término como palabra completa. Nunca usar prefijo abierto
+        #    (PURE -> PUREZA) ni LIKE amplio sobre toda la columna.
+        for token in sorted(tokens, key=lambda x: (-len(x), x)):
+            rx = re.compile(rf"(?<!\w){re.escape(token)}(?!\w)")
+            matched = [raw for n, raw in values.items() if rx.search(n)]
+            if not matched:
+                continue
+            detail = ", ".join(sorted(set(matched))[:3])
+            if len(set(matched)) > 3:
+                detail += ", …"
+            return exact_values_condition(field, matched), f"{label}: {detail}"
+
     return "", ""
 
 
@@ -1815,7 +1890,7 @@ _PROMOTER_FILTER_CONTROL_WORDS = {
     "cliente", "clientes", "compra", "compras", "compraron", "con", "sin", "de", "del",
     "la", "las", "el", "los", "cada", "todos", "todas", "este", "mes", "actual", "y",
     "en", "que", "cual", "cuales", "cuanto", "cuantos", "cuanta", "cuantas", "filtro",
-    "filtrar", "filtrame", "mostrame", "dame", "solo", "solamente", "nombre",
+    "filtrar", "filtrame", "mostrame", "dame", "solo", "solamente", "nombre", "tiene", "tienen",
 }
 
 
@@ -1859,22 +1934,76 @@ def _field_filter_from_text(field: str, label: str, qn: str, marker: str, alias:
     if not tail:
         return None
 
-    # Sacar palabras de control, conservando números (calibres/SKU-like text) y términos comerciales.
-    tokens = [
-        t for t in re.findall(r"[a-z0-9]+", tail)
-        if t not in _PROMOTER_FILTER_CONTROL_WORDS and (len(t) >= 2 or t.isdigit())
-    ]
-    if not tokens:
+    values = _sales_field_values(field)
+    if not values:
         return None
 
-    values = _sales_field_values(field)
-    # Primero: un valor real completo del snapshot está mencionado literalmente.
+    # 1) Si el valor real completo aparece en la consulta, usar igualdad exacta.
     exact = [raw for raw in values if _norm(raw) and re.search(rf"(?<!\w){re.escape(_norm(raw))}(?!\w)", qn)]
     if exact:
         quoted = ",".join(_sql_text(v.upper()) for v in exact)
         return f"UPPER({p}{field}) IN ({quoted})", f"{label}: " + ", ".join(exact)
 
-    # Después: búsqueda por las palabras escritas luego de la dimensión.
+    # Los nombres de promotor/supervisor no forman parte del valor comercial.
+    # Ej.: "marca pure gold de gaston fabre" debe leer PURE GOLD, no intentar
+    # buscar una marca que además contenga GASTON y FABRE.
+    person_tokens: set[str] = set()
+    try:
+        for person in _requested_promoters(qn):
+            person_tokens.update(re.findall(r"[a-z0-9]+", _norm(person)))
+        supervisor = _promoter_supervisor(qn)
+        if supervisor:
+            person_tokens.update(re.findall(r"[a-z0-9]+", _norm(supervisor)))
+    except Exception:
+        person_tokens = set()
+
+    # 2) Priorizar frases de dos o más palabras como coincidencia contigua y
+    # con límites de palabra. PURE GOLD puede coincidir con STELLA ARTOIS PURE
+    # GOLD, pero PURE nunca puede convertirse en PUREZA.
+    words = re.findall(r"[a-z0-9]+", tail)
+    runs: list[list[str]] = []
+    current: list[str] = []
+    for word in words:
+        if word in _PROMOTER_FILTER_CONTROL_WORDS or word in person_tokens or word.isdigit() and len(word) < 2:
+            if current:
+                runs.append(current)
+                current = []
+            continue
+        if len(word) >= 2 or word.isdigit():
+            current.append(word)
+    if current:
+        runs.append(current)
+
+    phrases: list[str] = []
+    for run in runs:
+        if len(run) < 2:
+            continue
+        for n in range(min(5, len(run)), 1, -1):
+            for i in range(len(run) - n + 1):
+                phrase = " ".join(run[i:i+n])
+                if phrase not in phrases:
+                    phrases.append(phrase)
+
+    for phrase in phrases:
+        rx = re.compile(rf"(?<!\w){re.escape(phrase)}(?!\w)")
+        matched = [raw for raw in values if rx.search(_norm(raw))]
+        if matched:
+            unique = list(dict.fromkeys(matched))
+            quoted = ",".join(_sql_text(v.upper()) for v in unique)
+            return f"UPPER({p}{field}) IN ({quoted})", f"{label}: " + ", ".join(unique[:5])
+
+    # 3) Fallback por tokens sueltos, quitando palabras de control y nombres de
+    # personas. Mantener AND sirve para expresiones como "stella gold" cuando
+    # no existe una frase exacta en el maestro.
+    tokens = [
+        t for t in re.findall(r"[a-z0-9]+", tail)
+        if t not in _PROMOTER_FILTER_CONTROL_WORDS
+        and t not in person_tokens
+        and (len(t) >= 2 or t.isdigit())
+    ]
+    if not tokens:
+        return None
+
     useful = tokens[:5]
     clauses = [f"UPPER({p}{field}) LIKE '%{t.upper().replace(chr(39), chr(39)*2)}%'" for t in useful]
     return "(" + " AND ".join(clauses) + ")", f"{label}: " + " ".join(useful)
