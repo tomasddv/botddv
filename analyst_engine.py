@@ -16,7 +16,7 @@ import pandas as pd
 
 from sources import frescura_source, grupos_source, repago_source, ventas_actual_source, promotores_kpi_source, topes_repo_source
 
-ENGINE_VERSION = "14.1"
+ENGINE_VERSION = "14.2"
 
 MAX_RESULT_ROWS = 500
 DISPLAY_ROWS = 15
@@ -605,7 +605,26 @@ def should_analyze(question: str) -> bool:
         and any(k in q for k in ("producto", "productos", "sku", "venc", "frescura"))
     )
     promoter_analytics = "promotor" in q or "promotores" in q or bool(_requested_promoters(q))
-    return current_sales or plural_or_set or comparative or aggregate or cross_source or correction_followup or zero_repago or purchase_date or purchase_contents or purchase_amount or freshness_month_list or promoter_analytics
+
+    # Repreguntas cortas y elípticas deben pasar por el analista antes que las
+    # reglas rápidas. El significado real se resuelve después con el contexto
+    # activo (cliente + tema). Ej.: después de "tope del 969",
+    # "¿cuántos lleva comprados?" significa bultos del tope, no compra EDF.
+    contextual_followup = (
+        len(q.split()) <= 8
+        and any(k in q for k in (
+            "lleva comprado", "lleva comprados", "lleva comprada", "lleva compradas",
+            "cuanto lleva", "cuantos lleva", "cuanta lleva", "cuantas lleva",
+            "cuanto le falta", "cuantos le faltan", "cuanto falta", "cuantos faltan",
+            "cuanto le queda", "cuantos le quedan", "cuanto queda", "cuantos quedan",
+            "cuanto resta", "cuantos restan", "que porcentaje lleva", "porcentaje lleva",
+            "que avance", "como va", "cuanto va", "llego al tope", "llegó al tope",
+            "cumplio el tope", "cumplió el tope", "paso el tope", "pasó el tope",
+            "supero el tope", "superó el tope", "tiene extension", "tiene extensión",
+            "segundo tope", "segundo tramo",
+        ))
+    )
+    return current_sales or plural_or_set or comparative or aggregate or cross_source or correction_followup or zero_repago or purchase_date or purchase_contents or purchase_amount or freshness_month_list or promoter_analytics or contextual_followup
 
 
 def _extract_limit(q: str, default: int = 15) -> int:
@@ -3182,8 +3201,26 @@ def _topes_customer_code(q: str, context: dict[str, Any] | None = None) -> tuple
             return clean, by_code[clean]
     ctx = context or {}
     active = str(ctx.get("active_client_id") or "")
-    if active in by_code and any(k in q for k in ("ese cliente", "este cliente", "el mismo", "y ")):
-        return active, by_code[active]
+    if active in by_code:
+        # Si el chat ya está hablando de Topes, el cliente activo se conserva
+        # aunque la repregunta no repita "cliente" ni el código. También
+        # preservamos la entidad si la última consulta analítica fue de Topes.
+        active_topic = _norm(ctx.get("active_topic") or "")
+        last_intent = _norm(ctx.get("last_intent") or "")
+        previous_plan = (_LAST_ANALYST_TURN.get("plan") or {}) if isinstance(_LAST_ANALYST_TURN, dict) else {}
+        previous_intent = _norm(previous_plan.get("intent") or "")
+        contextual = (
+            active_topic == "tope"
+            or last_intent.startswith("tope")
+            or "topes_repo" in previous_intent
+            or any(k in q for k in (
+                "ese cliente", "este cliente", "el mismo", "la misma", "y ",
+                "lleva", "falta", "faltan", "resta", "restan", "queda", "quedan",
+                "avance", "porcentaje", "segundo tope", "segundo tramo", "extension", "extensión",
+            ))
+        )
+        if contextual:
+            return active, by_code[active]
     return None
 
 
@@ -3199,7 +3236,32 @@ def _topes_repo_plan(q: str, context: dict[str, Any] | None = None) -> dict | No
     previous_plan = (_LAST_ANALYST_TURN.get("plan") or {}) if isinstance(_LAST_ANALYST_TURN, dict) else {}
     previous_question = str(_LAST_ANALYST_TURN.get("question") or "") if isinstance(_LAST_ANALYST_TURN, dict) else ""
     previous_intent = _norm(previous_plan.get("intent") or "")
+    ctx = context or {}
+    active_topic = _norm(ctx.get("active_topic") or "")
+    last_intent = _norm(ctx.get("last_intent") or "")
+    active_tope_context = (
+        active_topic == "tope"
+        or last_intent.startswith("tope")
+        or "topes_repo" in previous_intent
+    )
     topes_terms = any(k in qn for k in ("tope", "topes", "bulto", "bultos", "extension", "extensión", "segundo tramo"))
+
+    # Comprensión contextual: una frase corta puede no repetir la palabra
+    # "tope". Si venimos de ese tema, expresiones como "cuántos lleva
+    # comprados", "cuánto le falta" o "qué porcentaje lleva" continúan
+    # inequívocamente el cálculo de Topes del cliente activo.
+    contextual_metric_hint = any(k in qn for k in (
+        "lleva comprado", "lleva comprados", "lleva comprada", "lleva compradas",
+        "cuanto lleva", "cuantos lleva", "cuanta lleva", "cuantas lleva",
+        "cuanto le falta", "cuantos le faltan", "cuanto falta", "cuantos faltan",
+        "cuanto le queda", "cuantos le quedan", "cuanto queda", "cuantos quedan",
+        "cuanto resta", "cuantos restan", "avance", "porcentaje", "como va", "cuanto va",
+        "llego", "llegó", "cumplio", "cumplió", "paso", "pasó", "supero", "superó",
+        "segundo", "extension", "extensión",
+    ))
+    if not topes_terms and active_tope_context and contextual_metric_hint:
+        topes_terms = True
+
     if not topes_terms and "topes_repo" in previous_intent:
         # Continuidad de Topes sólo cuando la frase realmente parece una repregunta.
         # Antes cualquier oración corta heredaba el cliente anterior, por ejemplo
@@ -3247,20 +3309,21 @@ def _topes_repo_plan(q: str, context: dict[str, Any] | None = None) -> dict | No
     if customer:
         filters.append(f"t.cliente_codigo={_sql_text(customer[0])}")
         notes.append(f"cliente {customer[0]} · {customer[1]}")
-    if wants_extension and not wants_second:
+    if wants_extension and not wants_second and not customer:
         filters.append("COALESCE(t.extension_activa,0)=1")
         notes.append("extensión activa")
 
     remaining_col = "t.restante_segundo_bultos" if wants_second else "t.restante_bultos"
     advance_col = "CASE WHEN t.segundo_tope_bultos>0 THEN 100.0*t.segundo_tramo_comprado/t.segundo_tope_bultos ELSE NULL END" if wants_second else "t.avance_pct"
     if wants_second:
-        filters.append("COALESCE(t.extension_activa,0)=1")
+        if not customer:
+            filters.append("COALESCE(t.extension_activa,0)=1")
         notes.append("segundo tope")
 
-    if any(k in qn for k in ("llegaron", "llego", "llegó", "cumplieron", "cumplio", "cumplió", "pasados", "superaron", "al tope")) and not any(k in qn for k in ("no llegaron", "sin llegar")):
+    if not customer and any(k in qn for k in ("llegaron", "llego", "llegó", "cumplieron", "cumplio", "cumplió", "pasados", "superaron", "al tope")) and not any(k in qn for k in ("no llegaron", "sin llegar")):
         filters.append(f"COALESCE({remaining_col},999999)<=0")
         notes.append("tope alcanzado o superado")
-    elif any(k in qn for k in ("no llegaron", "sin llegar", "pendientes")):
+    elif not customer and any(k in qn for k in ("no llegaron", "sin llegar", "pendientes")):
         filters.append(f"COALESCE({remaining_col},999999)>0")
         notes.append("tope pendiente")
 
@@ -3309,29 +3372,90 @@ def _topes_repo_plan(q: str, context: dict[str, Any] | None = None) -> dict | No
     if notes:
         base_assumption += " Filtros: " + ", ".join(notes) + "."
 
-    # Un cliente concreto: mostrar toda la anatomía del tope.
+    # Un cliente concreto: responder la métrica preguntada y conservar un
+    # context_question explícito con el código para que las siguientes
+    # repreguntas no pierdan la entidad aunque sean elípticas.
     if customer:
-        second_cols = """
-               CASE WHEN COALESCE(t.extension_activa,0)=1 THEN 'Sí' ELSE 'No' END AS extension_activa, t.fecha_extension,
-               ROUND(t.segundo_tope_bultos,0) AS segundo_tope_bultos,
-               ROUND(t.segundo_tramo_comprado,2) AS segundo_tramo_comprado,
-               ROUND(t.restante_segundo_bultos,2) AS restante_segundo_bultos"""
+        wants_bought = any(k in qn for k in (
+            "lleva comprado", "lleva comprados", "lleva comprada", "lleva compradas",
+            "cuanto lleva", "cuantos lleva", "cuanto compro", "cuantos compro",
+            "bultos comprados", "comprado hasta",
+        ))
+        wants_remaining_metric = any(k in qn for k in (
+            "cuanto le falta", "cuantos le faltan", "cuanto falta", "cuantos faltan",
+            "cuanto le queda", "cuantos le quedan", "cuanto queda", "cuantos quedan",
+            "cuanto resta", "cuantos restan", "faltante", "restante",
+        ))
+        wants_advance_metric = any(k in qn for k in ("avance", "porcentaje", "%", "como va", "cuanto va"))
+        wants_status_metric = any(k in qn for k in (
+            "llego", "llegó", "cumplio", "cumplió", "paso", "pasó", "supero", "superó", "estado",
+        ))
+
+        context_question = f"cliente {customer[0]} topes " + qn
+        base_select = f"{pm_select}t.cliente_codigo, t.cliente, t.segmento, t.canal"
+
+        if wants_bought and not (wants_remaining_metric or wants_advance_metric or wants_second or wants_extension):
+            select_cols = base_select + ", ROUND(t.bultos_comprados,2) AS bultos_comprados"
+            title = "Bultos comprados para el tope"
+        elif wants_remaining_metric and not wants_second:
+            select_cols = (base_select +
+                ", ROUND(t.bultos_comprados,2) AS bultos_comprados"
+                ", ROUND(t.tope_bultos,0) AS tope_bultos"
+                ", ROUND(t.restante_bultos,2) AS restante_bultos")
+            title = "Faltante para el tope"
+        elif wants_advance_metric and not wants_second:
+            select_cols = (base_select +
+                ", ROUND(t.bultos_comprados,2) AS bultos_comprados"
+                ", ROUND(t.tope_bultos,0) AS tope_bultos"
+                ", ROUND(t.avance_pct,1) AS avance_pct")
+            title = "Avance del tope"
+        elif wants_status_metric and not wants_second:
+            select_cols = (base_select +
+                ", ROUND(t.bultos_comprados,2) AS bultos_comprados"
+                ", ROUND(t.tope_bultos,0) AS tope_bultos"
+                ", ROUND(t.avance_pct,1) AS avance_pct"
+                ", t.estado_tope")
+            title = "Estado del tope"
+        elif wants_second:
+            select_cols = (base_select +
+                ", CASE WHEN COALESCE(t.extension_activa,0)=1 THEN 'Sí' ELSE 'No' END AS extension_activa"
+                ", t.fecha_extension"
+                ", ROUND(t.segundo_tope_bultos,0) AS segundo_tope_bultos"
+                ", ROUND(t.segundo_tramo_comprado,2) AS segundo_tramo_comprado"
+                ", ROUND(t.restante_segundo_bultos,2) AS restante_segundo_bultos")
+            title = "Segundo tope del cliente"
+        elif wants_extension:
+            select_cols = (base_select +
+                ", CASE WHEN COALESCE(t.extension_activa,0)=1 THEN 'Sí' ELSE 'No' END AS extension_activa"
+                ", t.fecha_extension"
+                ", ROUND(t.segundo_tope_bultos,0) AS segundo_tope_bultos")
+            title = "Extensión de tope del cliente"
+        else:
+            select_cols = (base_select +
+                ", ROUND(t.bultos_comprados,2) AS bultos_comprados"
+                ", ROUND(t.tope_bultos,0) AS tope_bultos"
+                ", ROUND(t.avance_pct,1) AS avance_pct"
+                ", ROUND(t.restante_bultos,2) AS restante_bultos"
+                ", t.estado_tope"
+                ", CASE WHEN COALESCE(t.extension_activa,0)=1 THEN 'Sí' ELSE 'No' END AS extension_activa"
+                ", t.fecha_extension"
+                ", ROUND(t.segundo_tope_bultos,0) AS segundo_tope_bultos"
+                ", ROUND(t.segundo_tramo_comprado,2) AS segundo_tramo_comprado"
+                ", ROUND(t.restante_segundo_bultos,2) AS restante_segundo_bultos")
+            title = "Topes Core / Value del cliente"
+
         sql = f"""
             {('WITH ' + pm_cte) if pm_cte else ''}
-            SELECT {pm_select}t.cliente_codigo, t.cliente, t.segmento, t.canal,
-                   ROUND(t.bultos_comprados,2) AS bultos_comprados,
-                   ROUND(t.tope_bultos,0) AS tope_bultos,
-                   ROUND(t.avance_pct,1) AS avance_pct,
-                   ROUND(t.restante_bultos,2) AS restante_bultos,
-                   t.estado_tope,{second_cols}
+            SELECT {select_cols}
             FROM topes_repo t
             {pm_join}
             WHERE {where}
             ORDER BY t.segmento
             LIMIT {limit}
         """
-        return {"action":"query", "title":"Topes Core / Value del cliente", "sql":sql,
-                "assumption":base_assumption, "clarifying_question":"", "reason":"", "intent":"topes_repo_cliente", "display_all":True}
+        return {"action":"query", "title":title, "sql":sql,
+                "assumption":base_assumption, "clarifying_question":"", "reason":"",
+                "intent":"topes_repo_cliente", "display_all":True, "context_question":context_question}
 
     # Resumen por promotor: un renglón por promotor y segmento, útil para gestión.
     if by_promoter and (wants_count or "por promotor" in qn or "resumen" in qn or "cada promotor" in qn):
