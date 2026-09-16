@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
+import tempfile
+import time
 import unicodedata
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +22,54 @@ DISPLAY_ROWS = 15
 # breves como "esos no tienen venta 0". El contexto de sesión, cuando existe,
 # tiene prioridad sobre este fallback de proceso.
 _LAST_ANALYST_TURN: dict[str, Any] = {}
+_LAST_PROMOTER_TURN: dict[str, Any] = {}
+_PROMOTER_CONTEXT_TTL_SECONDS = 60 * 60
+_PROMOTER_CONTEXT_PATH = Path(os.environ.get(
+    "DDV_PROMOTER_CONTEXT_PATH",
+    str(Path(tempfile.gettempdir()) / "ddv_last_promoter_context.json"),
+))
+
+
+def _save_last_promoter_turn(question: str, plan: dict[str, Any]) -> None:
+    """Guarda la última consulta útil de promotores para repreguntas cortas.
+
+    Se conserva en memoria y, como fallback entre reruns/workers, en /tmp durante
+    una hora. El contexto de sesión sigue teniendo prioridad cuando la app lo pasa.
+    """
+    global _LAST_PROMOTER_TURN
+    payload = {
+        "question": str(question or "").strip(),
+        "plan": dict(plan or {}),
+        "saved_at": time.time(),
+    }
+    if not payload["question"]:
+        return
+    _LAST_PROMOTER_TURN = payload
+    try:
+        _PROMOTER_CONTEXT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _PROMOTER_CONTEXT_PATH.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_last_promoter_turn(context: dict[str, Any] | None = None) -> dict[str, Any]:
+    ctx = context or {}
+    q = str(ctx.get("_analyst_last_promoter_question") or "").strip()
+    p = ctx.get("_analyst_last_promoter_plan")
+    if q:
+        return {"question": q, "plan": p if isinstance(p, dict) else {}, "saved_at": time.time()}
+
+    if _LAST_PROMOTER_TURN.get("question"):
+        return dict(_LAST_PROMOTER_TURN)
+
+    try:
+        payload = json.loads(_PROMOTER_CONTEXT_PATH.read_text(encoding="utf-8"))
+        age = time.time() - float(payload.get("saved_at") or 0)
+        if 0 <= age <= _PROMOTER_CONTEXT_TTL_SECONDS and str(payload.get("question") or "").strip():
+            return payload
+    except Exception:
+        pass
+    return {}
 
 
 # -----------------------------
@@ -1912,39 +1964,88 @@ def _promoter_group_dimension(q: str) -> dict[str, str] | None:
 
 
 def _promoter_followup_plan(q: str, context: dict[str, Any] | None = None) -> dict | None:
-    """Aplica un filtro corto sobre la consulta de promotores anterior.
+    """Aplica filtros cortos sobre la última consulta de promotores.
 
-    Ej.: después de "qué clientes tiene Bruno por promotor", permite
-    "¿esos son de cerveza?", "¿y de UNG?", "¿sólo Corona?".
+    La repregunta no necesita repetir "promotor" ni usar un pronombre exacto.
+    Se aceptan formas naturales como: "son de CZA", "son de cerveza", "y de CZA",
+    "y cerveza", "de CZA", "solo CZA", "los de cerveza", "ahora UNG",
+    "solo marca Corona", "y SKU 2218", etc.
     """
     qn = _norm(q)
-    follow_ref = bool(re.search(r"\b(esos|esas|estos|estas|ellos|ellas|anteriores|mismos|mismas)\b", qn)) or qn.startswith("y ")
-    filter_hint = bool(_sales_focus_condition(qn, "v")[0] or _requested_business_units(qn, "v"))
-    explicit_filters, _ = _promoter_dashboard_filter_conditions(qn, "v")
-    filter_hint = filter_hint or bool(explicit_filters) or bool(_match_sales_sku(qn, context))
-    if not (follow_ref and filter_hint):
+    if not qn:
         return None
 
-    previous = _previous_analyst_question(context)
-    if _norm(previous) == qn:
-        fallback = str(_LAST_ANALYST_TURN.get("question") or "").strip()
-        if fallback and _norm(fallback) != qn:
-            previous = fallback
-    previous_plan = (_LAST_ANALYST_TURN.get("plan") or {}) if isinstance(_LAST_ANALYST_TURN, dict) else {}
-    previous_intent = _norm((context or {}).get("active_topic") or previous_plan.get("intent") or "")
-    if not previous or "promotor" not in previous_intent and "promotor" not in _norm(previous):
+    # ¿La frase actual contiene un filtro comercial real?
+    focus_cond, _ = _sales_focus_condition(qn, "v")
+    business_filters = _requested_business_units(qn, "v")
+    explicit_filters, _ = _promoter_dashboard_filter_conditions(qn, "v")
+    sku_filter = _match_sales_sku(qn, context)
+    generic_cond, _ = _generic_sales_dimension_condition(qn, "v")
+    filter_hint = bool(focus_cond or business_filters or explicit_filters or sku_filter or generic_cond)
+    if not filter_hint:
+        return None
+
+    # Formas de continuidad explícitas y también filtros muy breves sin pronombre.
+    follow_ref = bool(re.search(
+        r"\b(esos|esas|estos|estas|ellos|ellas|los|las|anteriores|mismos|mismas)\b", qn
+    ))
+    follow_prefix = qn.startswith((
+        "y ", "y de ", "de ", "son de ", "es de ", "solo ", "solamente ",
+        "ahora ", "pero ", "los de ", "las de ", "filtra ", "filtrame ",
+        "mostrame ", "mostra ", "dejame ", "quiero los ", "quiero las ",
+    ))
+    token_count = len(re.findall(r"[a-z0-9]+", qn))
+    short_filter = token_count <= 7 and len(qn) <= 80
+
+    last_promoter = _load_last_promoter_turn(context)
+    previous = str(last_promoter.get("question") or "").strip()
+    previous_plan = last_promoter.get("plan") if isinstance(last_promoter.get("plan"), dict) else {}
+
+    # Compatibilidad con contexto antiguo de sesión/global.
+    if not previous:
+        previous = _previous_analyst_question(context)
+        if _norm(previous) == qn:
+            fallback = str(_LAST_ANALYST_TURN.get("question") or "").strip()
+            if fallback and _norm(fallback) != qn:
+                previous = fallback
+        previous_plan = (_LAST_ANALYST_TURN.get("plan") or {}) if isinstance(_LAST_ANALYST_TURN, dict) else {}
+
+    previous_intent = _norm(
+        (context or {}).get("active_topic")
+        or previous_plan.get("intent")
+        or ""
+    )
+    has_promoter_base = bool(previous) and (
+        "promotor" in previous_intent
+        or "promotor" in _norm(previous)
+        or bool(_requested_promoters(_norm(previous)))
+        or bool(_promoter_supervisor(_norm(previous)))
+    )
+    if not has_promoter_base:
+        return None
+
+    # Si hay una consulta de promotores previa, un filtro corto es continuidad aunque
+    # el usuario no escriba "esos"/"y". Ej.: simplemente "cerveza" o "CZA".
+    if not (follow_ref or follow_prefix or short_filter):
         return None
 
     combined = f"{previous} {qn}"
-    for planner in (_promoter_dashboard_plan, _promoter_analytics_plan):
+    # Respetar el tipo de consulta original cuando sea posible. Para consultas de
+    # clientes/venta, el analizador de promotores es más específico; para KPIs puros,
+    # el dashboard conserva CCC/TBD/planificación.
+    original_intent = _norm(previous_plan.get("intent") or "")
+    planners = (_promoter_analytics_plan, _promoter_dashboard_plan)
+    if "promotores_kpi" in original_intent:
+        planners = (_promoter_dashboard_plan, _promoter_analytics_plan)
+
+    for planner in planners:
         plan = planner(combined, context)
-        if plan:
+        if plan and str(plan.get("action") or "").lower() != "unavailable":
             plan = dict(plan)
             base_assumption = str(plan.get("assumption") or "")
-            plan["assumption"] = ("Repregunta aplicada sobre la consulta anterior. " + base_assumption).strip()
+            plan["assumption"] = ("Repregunta aplicada sobre la consulta anterior de Promotores KPI. " + base_assumption).strip()
             return plan
     return None
-
 
 def _promoter_sales_where(q: str, context: dict[str, Any] | None = None, alias: str = "v", group_business: bool = False) -> tuple[str, list[str]]:
     """Filtros de venta compatibles con analítica por promotor.
@@ -3364,17 +3465,26 @@ def analyze_question(question: str, context: dict[str, Any] | None = None) -> An
     except Exception as exc:
         return AnalystResult(False, "", [], {"reason": "local_planner_error", "error": str(exc)})
 
-    # Guardar el turno recién después de planificar: así una repregunta puede leer
-    # la consulta anterior. Si el contexto es persistente por sesión, queda aislado
-    # allí; el global funciona como fallback para el despliegue actual de un solo bot.
-    global _LAST_ANALYST_TURN
-    _LAST_ANALYST_TURN = {"question": str(question or ""), "plan": dict(plan or {})}
-    if isinstance(context, dict):
-        context["_analyst_previous_question"] = str(question or "")
-        if plan.get("intent"):
-            context["active_topic"] = str(plan.get("intent"))
-
     action = str(plan.get("action") or "").lower()
+    intent = _norm(plan.get("intent") or "")
+
+    # Conservar como contexto sólo consultas analíticas útiles. Una frase que no pudo
+    # interpretarse NO debe borrar la última consulta válida: eso era lo que rompía
+    # repreguntas como "son de CZA" después de una consulta por promotor.
+    global _LAST_ANALYST_TURN
+    if action == "query":
+        _LAST_ANALYST_TURN = {"question": str(question or ""), "plan": dict(plan or {})}
+        if isinstance(context, dict):
+            context["_analyst_previous_question"] = str(question or "")
+            if plan.get("intent"):
+                context["active_topic"] = str(plan.get("intent"))
+
+        if "promotor" in intent:
+            _save_last_promoter_turn(str(question or ""), plan)
+            if isinstance(context, dict):
+                context["_analyst_last_promoter_question"] = str(question or "")
+                context["_analyst_last_promoter_plan"] = dict(plan or {})
+
     if action == "clarify":
         question_text = str(plan.get("clarifying_question") or "Necesito un dato más para responder.").strip()
         return AnalystResult(True, question_text, ["Analista DDV · local"], {"plan": plan})
@@ -3401,3 +3511,4 @@ def analyze_question(question: str, context: dict[str, Any] | None = None) -> An
             ["Analista DDV · local"],
             {"reason": "query_error", "error": str(exc), "plan": plan},
         )
+
