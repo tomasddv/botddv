@@ -1004,7 +1004,7 @@ def _sales_focus_condition(q: str, alias: str = "v") -> tuple[str, str]:
         return f"{p}es_nabs=1", "Nabs"
     if "cerveza" in q or re.search(r"\bcza\b", q):
         return f"{p}es_cza=1", "Total CZA"
-    if re.search(r"\bung\b", q):
+    if re.search(r"\bung\b", q) and "ung top" not in q and "ungtop" not in q:
         return f"UPPER({p}unidad_negocio) LIKE '%UNG%'", "UNG"
     if "gaseosa" in q:
         return f"UPPER({p}division)='GASEOSAS'", "Gaseosas"
@@ -1047,17 +1047,24 @@ _GENERIC_SALES_STOPWORDS = {
     "facturacion", "facturas", "hl", "hectolitros", "este", "mes", "actual", "corriente",
     "de", "del", "la", "las", "el", "los", "en", "por", "para", "con", "sin", "un", "una",
     "total", "acumulado", "mas", "menos", "mayor", "menor", "mucho", "poco", "top",
-    "trelew", "madryn", "puerto", "cza", "core", "value", "premium", "balanced", "nabs",
+    "trelew", "madryn", "puerto", "cza", "cerveza", "cervezas", "core", "value", "premium", "balanced", "nabs",
+    "promotor", "promotores", "supervisor", "supervisores", "filtro", "filtrar",
 }
 
 _GENERIC_DIMENSION_PRIORITY = (
     ("unidad_negocio", "unidad de negocio"),
     ("foco_comercial", "foco comercial"),
     ("division", "división"),
-    ("marca_unificada", "marca"),
+    ("marca_unificada", "marca unificada"),
+    ("marca", "marca"),
+    ("calibre_unificado", "calibre unificado"),
+    ("calibre", "calibre"),
     ("segmento", "segmento"),
     ("segmento_2", "segmento 2"),
     ("segmento_3", "segmento 3"),
+    ("ung_top", "UNG TOP"),
+    ("calibres_cpr", "Calibres CPR"),
+    ("producto", "producto"),
     ("subcanal", "subcanal"),
     ("agrupacion", "agrupación"),
     ("lista_precios", "lista de precios"),
@@ -1150,6 +1157,10 @@ def _requested_business_units(q: str, alias: str = "v") -> list[tuple[str, str]]
     # 1) Valores reales completos mencionados literalmente.
     for raw in sorted(unit_values, key=lambda x: (-len(_norm(x)), _norm(x))):
         nv = _norm(raw)
+        # "UNG TOP" es una dimensión del dashboard, no una solicitud de filtrar
+        # Unidad de Negocio=UNG.
+        if nv == "ung" and ("ung top" in qn or "ungtop" in qn):
+            continue
         if nv and re.search(rf"(^|\b){re.escape(nv)}(\b|$)", qn):
             add(raw, f"UPPER({p}unidad_negocio)={_sql_text(raw.upper())}")
 
@@ -1200,7 +1211,7 @@ def _requested_business_units(q: str, alias: str = "v") -> list[tuple[str, str]]
     if re.search(r"\bcza\b", qn) or "cerveza" in qn:
         add("CZA", f"{p}es_cza=1")
 
-    if re.search(r"\bung\b", qn):
+    if re.search(r"\bung\b", qn) and "ung top" not in qn and "ungtop" not in qn:
         add("UNG", f"UPPER({p}unidad_negocio) LIKE '%UNG%'")
 
     return found
@@ -1730,12 +1741,217 @@ def _promoter_mapping_cte(q: str) -> tuple[str, list[str]]:
     return cte, requested
 
 
+
+# Filtros equivalentes a los disponibles en promotores_kpi_dashboard/FILTER_FIELDS.
+_PROMOTER_DASHBOARD_FILTERS = (
+    ("marca_unificada", ("marca unificada",), "marca unificada"),
+    ("marca", ("marca",), "marca"),
+    ("division", ("division", "división"), "división"),
+    ("calibre_unificado", ("calibre unificado",), "calibre unificado"),
+    ("calibre", ("calibre",), "calibre"),
+    ("segmento_3", ("segmento 3", "segmento.3", "segmento3"), "segmento 3"),
+    ("segmento_2", ("segmento 2", "segmento.2", "segmento2"), "segmento 2"),
+    ("segmento", ("segmento",), "segmento"),
+    ("producto", ("nombre de producto", "producto",), "producto"),
+    ("unidad_negocio", ("unidad de negocio",), "unidad de negocio"),
+    ("ung_top", ("ung top", "ungtop"), "UNG TOP"),
+    ("calibres_cpr", ("calibres cpr", "calibre cpr", "cpr"), "Calibres CPR"),
+)
+
+_PROMOTER_FILTER_CONTROL_WORDS = {
+    "por", "promotor", "promotores", "supervisor", "supervisores", "venta", "ventas",
+    "cliente", "clientes", "compra", "compras", "compraron", "con", "sin", "de", "del",
+    "la", "las", "el", "los", "cada", "todos", "todas", "este", "mes", "actual", "y",
+    "en", "que", "cual", "cuales", "cuanto", "cuantos", "cuanta", "cuantas", "filtro",
+    "filtrar", "filtrame", "mostrame", "dame", "solo", "solamente", "nombre",
+}
+
+
+def _sales_field_values(field: str) -> list[str]:
+    values: dict[str, str] = {}
+    for row in _sales_rows():
+        raw = str(row.get(field) or "").strip()
+        key = _norm(raw)
+        if raw and key:
+            values.setdefault(key, raw)
+    return sorted(values.values(), key=lambda x: (-len(_norm(x)), _norm(x)))
+
+
+def _extract_dimension_tail(qn: str, marker: str) -> str:
+    """Texto que sigue a un filtro explícito, hasta la próxima dimensión/agrupación."""
+    pos = qn.find(marker)
+    if pos < 0:
+        return ""
+    tail = qn[pos + len(marker):].strip(" :,-")
+    if not tail:
+        return ""
+    # Si la dimensión se usa sólo para agrupar ("por marca"), no inventar un valor.
+    prefix = qn[max(0, pos - 4):pos]
+    if prefix.endswith("por ") and not tail:
+        return ""
+    stop_markers = [
+        " por promotor", " por supervisor", " por sku", " por producto", " por marca",
+        " por division", " por calibre", " por segmento", " por unidad de negocio",
+        " por ung top", " por calibres cpr", " con repago", " y repago", " repago",
+        " en hl", " en pesos", " en $",
+    ]
+    cuts = [tail.find(x) for x in stop_markers if tail.find(x) >= 0]
+    if cuts:
+        tail = tail[:min(cuts)].strip()
+    return tail
+
+
+def _field_filter_from_text(field: str, label: str, qn: str, marker: str, alias: str = "v") -> tuple[str, str] | None:
+    p = alias + "." if alias else ""
+    tail = _extract_dimension_tail(qn, marker)
+    if not tail:
+        return None
+
+    # Sacar palabras de control, conservando números (calibres/SKU-like text) y términos comerciales.
+    tokens = [
+        t for t in re.findall(r"[a-z0-9]+", tail)
+        if t not in _PROMOTER_FILTER_CONTROL_WORDS and (len(t) >= 2 or t.isdigit())
+    ]
+    if not tokens:
+        return None
+
+    values = _sales_field_values(field)
+    # Primero: un valor real completo del snapshot está mencionado literalmente.
+    exact = [raw for raw in values if _norm(raw) and re.search(rf"(?<!\w){re.escape(_norm(raw))}(?!\w)", qn)]
+    if exact:
+        quoted = ",".join(_sql_text(v.upper()) for v in exact)
+        return f"UPPER({p}{field}) IN ({quoted})", f"{label}: " + ", ".join(exact)
+
+    # Después: búsqueda por las palabras escritas luego de la dimensión.
+    useful = tokens[:5]
+    clauses = [f"UPPER({p}{field}) LIKE '%{t.upper().replace(chr(39), chr(39)*2)}%'" for t in useful]
+    return "(" + " AND ".join(clauses) + ")", f"{label}: " + " ".join(useful)
+
+
+def _promoter_dashboard_filter_conditions(q: str, alias: str = "v") -> tuple[list[str], list[str]]:
+    """Filtros explícitos del dashboard Promotores aplicados sobre Venta CHESS.
+
+    Permite combinar más de uno en la misma consulta: marca + segmento + calibre, etc.
+    Los focos (CZA/Core/Value...) y unidades de negocio se resuelven por separado.
+    """
+    qn = _norm(q)
+    conditions: list[str] = []
+    notes: list[str] = []
+    used_fields: set[str] = set()
+
+    for field, markers, label in _PROMOTER_DASHBOARD_FILTERS:
+        # Evitar que "marca" capture "marca unificada", etc.
+        if field == "marca" and "marca unificada" in qn:
+            continue
+        if field == "calibre" and "calibre unificado" in qn:
+            continue
+        if field == "segmento" and any(x in qn for x in ("segmento 2", "segmento.2", "segmento2", "segmento 3", "segmento.3", "segmento3")):
+            continue
+        for marker in markers:
+            if marker not in qn:
+                continue
+            # "por marca" / "por segmento" sin valor es agrupación, no filtro.
+            if re.search(rf"\bpor\s+{re.escape(marker)}\b", qn):
+                tail = _extract_dimension_tail(qn, marker)
+                if not tail or tail.startswith(("y ", "con ")):
+                    continue
+            match = _field_filter_from_text(field, label, qn, marker, alias)
+            if match and field not in used_fields:
+                conditions.append(match[0])
+                notes.append(match[1])
+                used_fields.add(field)
+            break
+
+    # Si no hubo un filtro explícito, aprovechar la detección genérica por valores
+    # (Corona, Patagonia, Pepsi, etc.) pero sólo una vez para evitar sobre-filtrar.
+    if not conditions:
+        generic_cond, generic_note = _generic_sales_dimension_condition(qn, alias)
+        if generic_cond and "supervisor:" not in generic_note.lower():
+            conditions.append(generic_cond)
+            notes.append(generic_note)
+
+    return conditions, notes
+
+
+def _promoter_group_dimension(q: str) -> dict[str, str] | None:
+    """Dimensión secundaria equivalente a los filtros/agrupadores del tablero KPI."""
+    qn = _norm(q)
+    specs = [
+        ((r"por\s+nombre\s+de\s+producto", r"por\s+producto", r"por\s+sku"), "sku_producto", "SKU / producto"),
+        ((r"por\s+marca\s+unificada",), "marca_unificada", "marca unificada"),
+        ((r"por\s+marca",), "marca", "marca"),
+        ((r"por\s+division", r"por\s+división"), "division", "división"),
+        ((r"por\s+calibre\s+unificado",), "calibre_unificado", "calibre unificado"),
+        ((r"por\s+calibre",), "calibre", "calibre"),
+        ((r"por\s+segmento\s*(?:3|\.3)",), "segmento_3", "segmento 3"),
+        ((r"por\s+segmento\s*(?:2|\.2)",), "segmento_2", "segmento 2"),
+        ((r"por\s+segmento",), "segmento", "segmento"),
+        ((r"por\s+unidad(?:es)?\s+de\s+negocio", r"por\s+negocio"), "unidad_negocio", "unidad de negocio"),
+        ((r"por\s+ung\s*top",), "ung_top", "UNG TOP"),
+        ((r"por\s+calibres?\s+cpr", r"por\s+cpr"), "calibres_cpr", "Calibres CPR"),
+        ((r"por\s+foco(?:\s+comercial)?",), "foco_comercial", "foco comercial"),
+    ]
+    for patterns, field, label in specs:
+        if any(re.search(p, qn) for p in patterns):
+            if field == "sku_producto":
+                return {
+                    "field": field,
+                    "select": ", v.sku, MAX(v.producto) AS producto",
+                    "group": ", v.sku",
+                    "order": ", v.sku",
+                    "label": " y SKU / producto",
+                }
+            return {
+                "field": field,
+                "select": f", COALESCE(NULLIF(v.{field},''),'SIN {label.upper()}') AS {field}",
+                "group": f", COALESCE(NULLIF(v.{field},''),'SIN {label.upper()}')",
+                "order": f", {field}",
+                "label": f" y {label}",
+            }
+    return None
+
+
+def _promoter_followup_plan(q: str, context: dict[str, Any] | None = None) -> dict | None:
+    """Aplica un filtro corto sobre la consulta de promotores anterior.
+
+    Ej.: después de "qué clientes tiene Bruno por promotor", permite
+    "¿esos son de cerveza?", "¿y de UNG?", "¿sólo Corona?".
+    """
+    qn = _norm(q)
+    follow_ref = bool(re.search(r"\b(esos|esas|estos|estas|ellos|ellas|anteriores|mismos|mismas)\b", qn)) or qn.startswith("y ")
+    filter_hint = bool(_sales_focus_condition(qn, "v")[0] or _requested_business_units(qn, "v"))
+    explicit_filters, _ = _promoter_dashboard_filter_conditions(qn, "v")
+    filter_hint = filter_hint or bool(explicit_filters) or bool(_match_sales_sku(qn, context))
+    if not (follow_ref and filter_hint):
+        return None
+
+    previous = _previous_analyst_question(context)
+    if _norm(previous) == qn:
+        fallback = str(_LAST_ANALYST_TURN.get("question") or "").strip()
+        if fallback and _norm(fallback) != qn:
+            previous = fallback
+    previous_plan = (_LAST_ANALYST_TURN.get("plan") or {}) if isinstance(_LAST_ANALYST_TURN, dict) else {}
+    previous_intent = _norm((context or {}).get("active_topic") or previous_plan.get("intent") or "")
+    if not previous or "promotor" not in previous_intent and "promotor" not in _norm(previous):
+        return None
+
+    combined = f"{previous} {qn}"
+    for planner in (_promoter_dashboard_plan, _promoter_analytics_plan):
+        plan = planner(combined, context)
+        if plan:
+            plan = dict(plan)
+            base_assumption = str(plan.get("assumption") or "")
+            plan["assumption"] = ("Repregunta aplicada sobre la consulta anterior. " + base_assumption).strip()
+            return plan
+    return None
+
+
 def _promoter_sales_where(q: str, context: dict[str, Any] | None = None, alias: str = "v", group_business: bool = False) -> tuple[str, list[str]]:
     """Filtros de venta compatibles con analítica por promotor.
 
-    No interpreta la palabra promotor como vendedor. Cuando se agrupa por unidad de
-    negocio, evita aplicar un filtro genérico derivado de la propia dimensión, pero sí
-    respeta negocios concretos nombrados (CZA, Aguas, Marketplace, Red Bull, etc.).
+    Replica los filtros comerciales de promotores_kpi_dashboard sobre Venta CHESS:
+    foco, unidad de negocio, SKU, marca, división, calibre, segmentos, producto,
+    UNG TOP y Calibres CPR.
     """
     p = alias + "." if alias else ""
     filters: list[str] = []
@@ -1765,8 +1981,19 @@ def _promoter_sales_where(q: str, context: dict[str, Any] | None = None, alias: 
     # Negocios concretos nombrados. Si sólo dice "por unidad de negocio", no filtra.
     units = _requested_business_units(q, alias)
     if units:
-        filters.append("(" + " OR ".join(cond for _, cond in units) + ")")
-        notes.append("negocios: " + ", ".join(label for label, _ in units))
+        unit_conditions = [cond for _, cond in units]
+        # CZA/UNG pueden coincidir con el foco anterior: la redundancia es segura,
+        # pero evitamos repetir exactamente la misma condición.
+        unique_units = [c for c in unit_conditions if c not in filters]
+        if unique_units:
+            filters.append("(" + " OR ".join(unique_units) + ")")
+            notes.append("negocios: " + ", ".join(label for label, _ in units))
+
+    dashboard_filters, dashboard_notes = _promoter_dashboard_filter_conditions(q, alias)
+    for cond, note in zip(dashboard_filters, dashboard_notes):
+        if cond not in filters:
+            filters.append(cond)
+            notes.append(note)
 
     time_cond, time_label = _sales_time_condition(q, alias)
     if time_cond:
@@ -1860,18 +2087,9 @@ def _promoter_dashboard_plan(q: str, context: dict[str, Any] | None = None) -> d
             "reason":"La fuente **Promotores KPI** todavía no tiene el maestro de rutas cargado. Se actualizará automáticamente desde RUTAS / reporte de clientes.",
         }
 
-    # Filtros de venta. Para promotores KPI el promotor se toma del maestro de ruta,
-    # no de una búsqueda textual sobre vendedor.
-    sales_filters = []
-    if focus_cond:
-        sales_filters.append(focus_cond)
-    time_cond, time_note = _sales_time_condition(qn, "v")
-    if time_cond:
-        sales_filters.append(time_cond)
-    loc = _location(qn)
-    if loc in {"TRELEW", "MADRYN"}:
-        sales_filters.append(f"UPPER(v.localidad_base)={_sql_text(loc)}")
-    sales_where = ("WHERE " + " AND ".join(sales_filters)) if sales_filters else ""
+    # Filtros de venta equivalentes a los del dashboard Promotores. La asignación
+    # cliente→promotor sigue viniendo del maestro de rutas; CHESS sólo aporta venta.
+    sales_where, dashboard_sales_notes = _promoter_sales_where(qn, context, "v")
 
     # Sólo consulta planificación registrada.
     if wants_plan and not any(k in qn for k in ("cumplimiento", "restantes", "real", "ccc", "tbd", "venta", "compra", "repago")):
@@ -1953,6 +2171,8 @@ def _promoter_dashboard_plan(q: str, context: dict[str, Any] | None = None) -> d
             LIMIT {MAX_RESULT_ROWS}
         """
         assumption = period_note + f" Foco: {metric_focus}. Universo de clientes tomado del maestro de rutas del dashboard Promotores."
+        if dashboard_sales_notes:
+            assumption += " Filtros: " + ", ".join(dashboard_sales_notes) + "."
         return {"action":"query", "title":"Clientes no compradores por promotor", "sql":sql,
                 "assumption":assumption, "clarifying_question":"", "reason":"", "intent":"promotores_kpi_no_compradores", "display_all": True}
 
@@ -2026,6 +2246,8 @@ def _promoter_dashboard_plan(q: str, context: dict[str, Any] | None = None) -> d
     if focus_label:
         title += f" · {focus_label}"
     assumption = period_note + f" Foco: {metric_focus}. Clientes ruta y planificación provienen del dashboard Promotores; venta real proviene de CHESS."
+    if dashboard_sales_notes:
+        assumption += " Filtros: " + ", ".join(dashboard_sales_notes) + "."
     if route_group:
         assumption += f" Grupo de ruta: {route_group}."
     if wants_repago:
@@ -2084,15 +2306,10 @@ def _promoter_analytics_plan(q: str, context: dict[str, Any] | None = None) -> d
         "producto", "segmento", "unidad de negocio", "negocio"
     ))
 
-    by_sku = bool(re.search(r"\bpor\s+(?:sku|producto)s?\b", qn)) or (
-        "promotor" in qn and any(k in qn for k in ("cada sku", "por sku", "por producto", "promotor y sku", "promotores y sku"))
-    )
-    by_segment = bool(re.search(r"\bpor\s+segmento\b", qn)) or any(k in qn for k in ("cada segmento", "promotor y segmento", "promotores y segmento"))
-    by_business = (
-        "por unidad de negocio" in qn or "por unidades de negocio" in qn
-        or "cada unidad de negocio" in qn or "por negocio" in qn
-        or "promotor y unidad de negocio" in qn or "promotores y unidad de negocio" in qn
-    )
+    group_dimension = _promoter_group_dimension(qn)
+    by_sku = bool(group_dimension and group_dimension.get("field") == "sku_producto")
+    by_segment = bool(group_dimension and group_dimension.get("field") in {"segmento", "segmento_2", "segmento_3"})
+    by_business = bool(group_dimension and group_dimension.get("field") == "unidad_negocio")
     by_client = bool(re.search(r"\bpor\s+cliente\b", qn)) or any(k in qn for k in (
         "detalle de clientes", "listame los clientes", "lista de clientes", "que clientes", "cuales clientes"
     ))
@@ -2194,7 +2411,7 @@ def _promoter_analytics_plan(q: str, context: dict[str, Any] | None = None) -> d
             }
 
         # Detalle por cliente si se pide expresamente quiénes son.
-        if by_client and not by_sku and not by_segment and not by_business:
+        if by_client and not group_dimension:
             sql = f"""
                 WITH {pm_cte.strip()}
                 SELECT pm.promotor,
@@ -2218,22 +2435,12 @@ def _promoter_analytics_plan(q: str, context: dict[str, Any] | None = None) -> d
                 "display_all": "todos" in qn,
             }
 
-        # Dimensión secundaria solicitada.
-        if by_sku:
-            dim_select = ", v.sku, MAX(v.producto) AS producto"
-            dim_group = ", v.sku"
-            dim_order = ", v.sku"
-            dim_label = " y SKU"
-        elif by_segment:
-            dim_select = ", COALESCE(NULLIF(v.segmento,''),'SIN SEGMENTO') AS segmento"
-            dim_group = ", COALESCE(NULLIF(v.segmento,''),'SIN SEGMENTO')"
-            dim_order = ", segmento"
-            dim_label = " y segmento"
-        elif by_business:
-            dim_select = ", COALESCE(NULLIF(v.unidad_negocio,''),'SIN UNIDAD') AS unidad_negocio"
-            dim_group = ", COALESCE(NULLIF(v.unidad_negocio,''),'SIN UNIDAD')"
-            dim_order = ", unidad_negocio"
-            dim_label = " y unidad de negocio"
+        # Dimensión secundaria solicitada (mismos ejes del dashboard KPI Promotores).
+        if group_dimension:
+            dim_select = group_dimension["select"]
+            dim_group = group_dimension["group"]
+            dim_order = group_dimension["order"]
+            dim_label = group_dimension["label"]
         else:
             dim_select = ""
             dim_group = ""
@@ -2241,7 +2448,7 @@ def _promoter_analytics_plan(q: str, context: dict[str, Any] | None = None) -> d
             dim_label = ""
 
         metric_cols: list[str] = []
-        if asks_count or "cliente" in qn or (wants_repago and not any((by_sku, by_segment, by_business))):
+        if asks_count or "cliente" in qn or (wants_repago and not group_dimension):
             metric_cols.append("COUNT(DISTINCT v.cliente_codigo) AS clientes_con_compra")
         if wants_hl:
             metric_cols.append("ROUND(SUM(v.hl),2) AS hl")
@@ -2321,8 +2528,8 @@ def _promoter_analytics_plan(q: str, context: dict[str, Any] | None = None) -> d
 
         if sales_notes:
             assumption += " Filtros: " + ", ".join(sales_notes) + "."
-        if by_sku or by_segment or by_business:
-            assumption += " Cada venta se atribuye al promotor asignado al código de cliente en Grupo de clientes."
+        if group_dimension:
+            assumption += " Cada venta se atribuye al promotor asignado al código de cliente en Promotores KPI."
 
         return {
             "action":"query", "title":title, "sql":sql, "assumption":assumption,
@@ -2864,6 +3071,12 @@ def _local_plan(question: str, context: dict[str, Any] | None = None) -> dict:
     if plan:
         return plan
 
+    # Repreguntas sobre el resultado anterior de Promotores: "¿esos son de cerveza?",
+    # "¿y de UNG?", "¿sólo marca Corona?", etc.
+    plan = _promoter_followup_plan(q, context)
+    if plan:
+        return plan
+
     # Reglas y KPIs importados del dashboard Promotores (CCC, TBD, planificación, rutas).
     plan = _promoter_dashboard_plan(q, context)
     if plan:
@@ -3037,8 +3250,17 @@ FRIENDLY = {
     "negocio": "Negocio",
     "supervisor": "Supervisor",
     "marca": "Marca",
+    "marca_unificada": "Marca unificada",
     "division": "División",
+    "calibre": "Calibre",
+    "calibre_unificado": "Calibre unificado",
+    "segmento": "Segmento",
+    "segmento_2": "Segmento 2",
+    "segmento_3": "Segmento 3",
     "unidad_negocio": "Unidad de negocio",
+    "ung_top": "UNG TOP",
+    "calibres_cpr": "Calibres CPR",
+    "foco_comercial": "Foco comercial",
     "localidad_base": "Base",
     "stock_bultos": "Stock bultos",
     "mes": "Mes",
