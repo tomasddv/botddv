@@ -16,7 +16,7 @@ import pandas as pd
 
 from sources import frescura_source, grupos_source, repago_source, ventas_actual_source, promotores_kpi_source, topes_repo_source
 
-ENGINE_VERSION = "14.2"
+ENGINE_VERSION = "14.3"
 
 MAX_RESULT_ROWS = 500
 DISPLAY_ROWS = 15
@@ -1135,6 +1135,23 @@ def _match_sales_seller(q: str) -> tuple[str, str] | None:
     return None
 
 
+def _is_laton_710_query(q: str) -> bool:
+    """Reconoce formas naturales del KPI/calibre Latones 710.
+
+    El 710 aislado no alcanza: exigimos contexto de calibre/envase para no
+    confundir un código de cliente/SKU con el foco comercial.
+    """
+    qn = _norm(q)
+    return bool(
+        re.search(r"\b(?:laton|latones|lata|latas|calibre)\b[^0-9]{0,12}710(?:\s*cc)?\b", qn)
+        or re.search(r"\b710\s*cc\b", qn)
+        # En el tablero el foco se llama Latones 710; en conversación,
+        # "latones" a secas se interpreta igual salvo que el usuario esté
+        # nombrando explícitamente un combo/producto.
+        or (re.search(r"\b(?:laton|latones)\b", qn) and "combo" not in qn and "producto" not in qn)
+    )
+
+
 def _sales_focus_condition(q: str, alias: str = "v") -> tuple[str, str]:
     p = alias + "." if alias else ""
     if "above core" in q or "abovecore" in q:
@@ -1147,7 +1164,7 @@ def _sales_focus_condition(q: str, alias: str = "v") -> tuple[str, str]:
         return f"{p}es_value=1", "Value"
     if re.search(r"\bcore\b", q):
         return f"{p}es_core=1", "Core"
-    if "laton 710" in q or "latones 710" in q or "710" in q and "laton" in q:
+    if _is_laton_710_query(q):
         return f"{p}es_laton_710=1", "Latones 710"
     if "nabs" in q:
         return f"{p}es_nabs=1", "Nabs"
@@ -1197,6 +1214,10 @@ _GENERIC_SALES_STOPWORDS = {
     "de", "del", "la", "las", "el", "los", "en", "por", "para", "con", "sin", "un", "una",
     "total", "acumulado", "mas", "menos", "mayor", "menor", "mucho", "poco", "top",
     "trelew", "madryn", "puerto", "cza", "cerveza", "cervezas", "core", "value", "premium", "balanced", "nabs",
+    # Los nombres de focos/KPI conocidos no deben volver a interpretarse como
+    # nombres de producto por el matcher genérico. Ej.: "latones 710" no es
+    # el producto "COMBO LATONES ...", sino el foco comercial Latones 710.
+    "laton", "latones",
     "promotor", "promotores", "supervisor", "supervisores", "filtro", "filtrar",
 }
 
@@ -1535,6 +1556,14 @@ def _sales_filters(q: str, context: dict[str, Any] | None = None, alias: str = "
         if focus_cond:
             filters.append(focus_cond)
             notes.append(focus_label)
+
+        # Latones 710 puede combinarse con otro foco, por ejemplo
+        # "clientes Core que compraron latones 710". Si el foco principal fue
+        # Core/Value/etc., agregamos además el filtro 710.
+        if _is_laton_710_query(q) and focus_label != "Latones 710":
+            filters.append(f"{p}es_laton_710=1")
+            notes.append("Latones 710")
+
         if not alias_cond:
             generic_cond, generic_label = _generic_sales_dimension_condition(q, alias)
             if generic_cond:
@@ -4128,15 +4157,22 @@ def _validate_sql(sql: str) -> str:
     upper = clean.upper()
     if not clean or not (upper.startswith("SELECT ") or upper.startswith("WITH ")):
         raise ValueError("El plan no generó un SELECT de lectura.")
-    if ";" in clean or "--" in clean or "/*" in clean or "*/" in clean:
+
+    # La seguridad se valida sobre la estructura SQL, no sobre el texto de los
+    # literales. Un producto real puede llamarse, por ejemplo,
+    # "COMBO ... BAJO DROP FEB"; la palabra DROP dentro de una cadena no es una
+    # instrucción SQL y antes provocaba falsos ValueError.
+    structural = re.sub(r"'(?:''|[^'])*'", "''", clean)
+    structural_upper = structural.upper()
+    if ";" in structural or "--" in structural or "/*" in structural or "*/" in structural:
         raise ValueError("SQL no permitido.")
-    if FORBIDDEN_SQL.search(clean) or "SQLITE_" in upper:
+    if FORBIDDEN_SQL.search(structural) or "SQLITE_" in structural_upper:
         raise ValueError("SQL no permitido.")
 
     # Comprobación conservadora de tablas explícitas después de FROM/JOIN.
-    refs = re.findall(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)", clean, flags=re.I)
+    refs = re.findall(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)", structural, flags=re.I)
     # CTEs pueden aparecer como FROM cte; reconocer nombres declarados en WITH.
-    ctes = set(re.findall(r"(?:WITH|,)\s*([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(", clean, flags=re.I))
+    ctes = set(re.findall(r"(?:WITH|,)\s*([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(", structural, flags=re.I))
     for table in refs:
         if table.lower() not in ALLOWED_TABLES and table not in ctes and table.lower() not in {x.lower() for x in ctes}:
             raise ValueError(f"Tabla no permitida: {table}")
