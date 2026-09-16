@@ -15,6 +15,8 @@ import pandas as pd
 
 from sources import frescura_source, grupos_source, repago_source, ventas_actual_source, promotores_kpi_source
 
+ENGINE_VERSION = "13.6"
+
 MAX_RESULT_ROWS = 500
 DISPLAY_ROWS = 15
 
@@ -1124,6 +1126,39 @@ _GENERIC_DIMENSION_PRIORITY = (
 )
 
 
+_COMMERCIAL_ALIASES = (
+    # Alias inequívocos confirmados contra AUXILIARES / Venta diaria.
+    ("stella artois pure gold", "marca", ("STELLA ARTOIS PURE GOLD",), "marca: STELLA ARTOIS PURE GOLD"),
+    ("stella pure gold", "marca", ("STELLA ARTOIS PURE GOLD",), "marca: STELLA ARTOIS PURE GOLD"),
+    ("pure gold", "marca", ("STELLA ARTOIS PURE GOLD",), "marca: STELLA ARTOIS PURE GOLD"),
+    ("puregold", "marca", ("STELLA ARTOIS PURE GOLD",), "marca: STELLA ARTOIS PURE GOLD"),
+)
+
+
+def _commercial_alias_condition(q: str, alias: str = "v") -> tuple[str, str]:
+    """Resuelve nombres comerciales inequívocos antes del matching genérico.
+
+    Evita colisiones entre términos parecidos de distintas dimensiones, por ejemplo
+    PURE GOLD vs NESTLE PUREZA VITAL. Los alias se resuelven sólo a valores reales
+    y con la dimensión comercial correcta.
+    """
+    qn = _norm(q)
+    p = alias + "." if alias else ""
+    compact = qn.replace(" ", "")
+    for phrase, field, values, note in sorted(_COMMERCIAL_ALIASES, key=lambda x: -len(x[0])):
+        pn = _norm(phrase)
+        matched = False
+        if " " in pn:
+            matched = bool(re.search(rf"(?<!\w){re.escape(pn)}(?!\w)", qn))
+        else:
+            matched = pn in compact
+        if not matched:
+            continue
+        quoted = ",".join(_sql_text(str(v).upper()) for v in values)
+        return f"UPPER({p}{field}) IN ({quoted})", note
+    return "", ""
+
+
 def _generic_sales_dimension_condition(q: str, alias: str = "v") -> tuple[str, str]:
     """Reconoce valores comerciales aunque el usuario no nombre la dimensión.
 
@@ -1367,6 +1402,10 @@ def _sales_filters(q: str, context: dict[str, Any] | None = None, alias: str = "
     if sku:
         filters.append(f"{p}sku={_sql_text(sku[0])}")
         notes.append(f"SKU {sku[0]} · {sku[1]}")
+    alias_cond, alias_note = _commercial_alias_condition(q, alias)
+    if alias_cond:
+        filters.append(alias_cond)
+        notes.append(alias_note)
     seller = _match_sales_seller(q)
     if seller:
         filters.append(f"{p}vendedor_codigo={_sql_text(seller[0])}")
@@ -1376,10 +1415,11 @@ def _sales_filters(q: str, context: dict[str, Any] | None = None, alias: str = "
         if focus_cond:
             filters.append(focus_cond)
             notes.append(focus_label)
-        generic_cond, generic_label = _generic_sales_dimension_condition(q, alias)
-        if generic_cond:
-            filters.append(generic_cond)
-            notes.append(generic_label)
+        if not alias_cond:
+            generic_cond, generic_label = _generic_sales_dimension_condition(q, alias)
+            if generic_cond:
+                filters.append(generic_cond)
+                notes.append(generic_label)
     time_cond, time_label = _sales_time_condition(q, alias)
     if time_cond:
         filters.append(time_cond)
@@ -2009,7 +2049,7 @@ def _field_filter_from_text(field: str, label: str, qn: str, marker: str, alias:
     return "(" + " AND ".join(clauses) + ")", f"{label}: " + " ".join(useful)
 
 
-def _promoter_dashboard_filter_conditions(q: str, alias: str = "v") -> tuple[list[str], list[str]]:
+def _promoter_dashboard_filter_conditions(q: str, alias: str = "v", allow_generic: bool = True) -> tuple[list[str], list[str]]:
     """Filtros explícitos del dashboard Promotores aplicados sobre Venta CHESS.
 
     Permite combinar más de uno en la misma consulta: marca + segmento + calibre, etc.
@@ -2045,7 +2085,7 @@ def _promoter_dashboard_filter_conditions(q: str, alias: str = "v") -> tuple[lis
 
     # Si no hubo un filtro explícito, aprovechar la detección genérica por valores
     # (Corona, Patagonia, Pepsi, etc.) pero sólo una vez para evitar sobre-filtrar.
-    if not conditions:
+    if not conditions and allow_generic:
         generic_cond, generic_note = _generic_sales_dimension_condition(qn, alias)
         if generic_cond and "supervisor:" not in generic_note.lower():
             conditions.append(generic_cond)
@@ -2202,6 +2242,12 @@ def _promoter_sales_where(q: str, context: dict[str, Any] | None = None, alias: 
         filters.append(f"{p}sku={_sql_text(sku[0])}")
         notes.append(f"SKU {sku[0]} · {sku[1]}")
 
+    # Alias comerciales inequívocos se resuelven antes del detector genérico.
+    alias_cond, alias_note = _commercial_alias_condition(q, alias)
+    if alias_cond:
+        filters.append(alias_cond)
+        notes.append(alias_note)
+
     # Focos comerciales explícitos (CORE, VALUE, CZA, etc.).
     focus_cond, focus_label = _sales_focus_condition(q, alias)
     if focus_cond:
@@ -2219,7 +2265,7 @@ def _promoter_sales_where(q: str, context: dict[str, Any] | None = None, alias: 
             filters.append("(" + " OR ".join(unique_units) + ")")
             notes.append("negocios: " + ", ".join(label for label, _ in units))
 
-    dashboard_filters, dashboard_notes = _promoter_dashboard_filter_conditions(q, alias)
+    dashboard_filters, dashboard_notes = _promoter_dashboard_filter_conditions(q, alias, allow_generic=not bool(alias_cond))
     for cond, note in zip(dashboard_filters, dashboard_notes):
         if cond not in filters:
             filters.append(cond)
@@ -3575,7 +3621,7 @@ def _source_labels(tables: list[str]) -> list[str]:
         out.append("CHESS · venta mes actual · snapshot local")
     if any(t in {"promotores_ruta", "promotores_plan"} for t in tables):
         out.append("Promotores KPI · rutas / planificación · snapshot local")
-    out.append("Analista DDV · SQL local")
+    out.append(f"Analista DDV v{ENGINE_VERSION} · SQL local")
     return out
 
 
