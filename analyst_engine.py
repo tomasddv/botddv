@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+import difflib
 import tempfile
 import time
 import unicodedata
@@ -13,9 +14,9 @@ from typing import Any
 
 import pandas as pd
 
-from sources import frescura_source, grupos_source, repago_source, ventas_actual_source, promotores_kpi_source
+from sources import frescura_source, grupos_source, repago_source, ventas_actual_source, promotores_kpi_source, topes_repo_source
 
-ENGINE_VERSION = "13.6"
+ENGINE_VERSION = "14.0"
 
 MAX_RESULT_ROWS = 500
 DISPLAY_ROWS = 15
@@ -353,6 +354,31 @@ def _promotores_kpi_frames() -> dict[str, pd.DataFrame]:
     }
 
 
+def _topes_repo_frames() -> dict[str, pd.DataFrame]:
+    """Topes canónicos del tablero Control bultos Core / Value.
+
+    `topes_cliente` se mantiene como alias compatible para no romper consultas
+    antiguas, pero desde v14.0 su contenido proviene del repo de Topes y no del
+    cálculo legado de Grupo de clientes.
+    """
+    snap = _safe_snap(topes_repo_source)
+    rows = snap.get("rows") or []
+    df = pd.DataFrame(rows)
+    meta = [{
+        "period_start": snap.get("period_start") or "",
+        "period_end": snap.get("period_end") or "",
+        "updated_at": snap.get("updated_at") or "",
+        "clientes": int(snap.get("clients_count") or 0),
+    }] if snap else []
+    out = {
+        "topes_repo": df,
+        "topes_repo_meta": pd.DataFrame(meta),
+    }
+    if rows:
+        out["topes_cliente"] = df.copy()
+    return out
+
+
 def _ventas_actual_frames() -> dict[str, pd.DataFrame]:
     snap = _safe_snap(ventas_actual_source)
     rows = snap.get("rows") or []
@@ -376,6 +402,8 @@ def _frames() -> dict[str, pd.DataFrame]:
     frames.update(_frescura_frames())
     frames.update(_repago_frames())
     frames.update(_grupos_frames())
+    # Topes del repo pisan deliberadamente el alias legado `topes_cliente`.
+    frames.update(_topes_repo_frames())
     frames.update(_ventas_actual_frames())
     frames.update(_promotores_kpi_frames())
     return frames
@@ -389,7 +417,9 @@ EMPTY_SCHEMAS = {
     "repago_edf": ["cliente_codigo", "cliente", "razon_social", "activo", "serie", "modelo", "negocio", "estado", "deposito", "direccion", "localidad", "objetivo_hl", "repago_trimestre_pct", "hl_asignado_trimestre", "banda_trimestre", "repago_ultimo_mes_pct", "hl_asignado_ultimo_mes", "banda_ultimo_mes"],
     "ventas_mensuales_cliente": ["cliente_codigo", "cliente", "periodo", "negocio", "hl"],
     "descuentos_cliente": ["cliente_codigo", "cliente", "segmento", "subsegmento", "descuento_pct", "grupo", "promotor", "ruta"],
-    "topes_cliente": ["cliente_codigo", "cliente", "segmento", "canal", "tope_bultos"],
+    "topes_cliente": ["cliente_codigo", "cliente", "segmento", "canal", "ruta", "vendedor", "bultos_comprados", "tope_bultos", "avance_pct", "restante_bultos", "estado_tope", "primer_tope_comprado", "extension_activa", "fecha_extension", "segundo_tope_bultos", "segundo_tramo_comprado", "restante_segundo_bultos", "comentario_extension", "actualizado_extension"],
+    "topes_repo": ["cliente_codigo", "cliente", "segmento", "canal", "ruta", "vendedor", "bultos_comprados", "tope_bultos", "avance_pct", "restante_bultos", "estado_tope", "primer_tope_comprado", "extension_activa", "fecha_extension", "segundo_tope_bultos", "segundo_tramo_comprado", "restante_segundo_bultos", "comentario_extension", "actualizado_extension"],
+    "topes_repo_meta": ["period_start", "period_end", "updated_at", "clientes"],
     "ventas_mes_actual": ["fecha", "cliente_codigo", "cliente", "razon_social", "nombre_fantasia", "agrupacion", "localidad_base", "lista_precios", "subcanal", "vendedor_codigo", "vendedor", "supervisor", "ruta", "sku", "producto", "marca", "marca_unificada", "segmento", "segmento_2", "segmento_3", "calibre", "calibre_unificado", "division", "producto_estadistico", "unidad_negocio", "ung_top", "calibres_cpr", "foco_comercial", "es_cza", "es_core", "es_value", "es_above_core", "es_premium", "es_balanced", "es_nabs", "es_laton_710", "hl", "importe_neto", "importe_final", "facturas"],
     "ventas_mes_actual_meta": ["period_start", "period_end", "period_month", "updated_at", "total_hl", "clientes", "skus"],
     "maestro_clientes_actual": ["cliente_codigo", "razon_social", "nombre_fantasia", "agrupacion", "localidad_base", "lista_precios", "subcanal", "ramo_cliente"],
@@ -1145,7 +1175,8 @@ def _commercial_alias_condition(q: str, alias: str = "v") -> tuple[str, str]:
     qn = _norm(q)
     p = alias + "." if alias else ""
     compact = qn.replace(" ", "")
-    for phrase, field, values, note in sorted(_COMMERCIAL_ALIASES, key=lambda x: -len(x[0])):
+    aliases = sorted(_COMMERCIAL_ALIASES, key=lambda x: -len(x[0]))
+    for phrase, field, values, note in aliases:
         pn = _norm(phrase)
         matched = False
         if " " in pn:
@@ -1156,6 +1187,24 @@ def _commercial_alias_condition(q: str, alias: str = "v") -> tuple[str, str]:
             continue
         quoted = ",".join(_sql_text(str(v).upper()) for v in values)
         return f"UPPER({p}{field}) IN ({quoted})", note
+
+    # Fallback fuzzy sobre ventanas de la misma longitud. Se usa únicamente para
+    # alias inequívocos, por lo que tolera `pure gol` / `stela artois pure gol`
+    # sin abrir la puerta a coincidencias parciales como PURE -> PUREZA.
+    q_tokens = re.findall(r"[a-z0-9]+", qn)
+    for phrase, field, values, note in aliases:
+        pn = _norm(phrase)
+        pt = pn.split()
+        n = len(pt)
+        if n < 2 or len(q_tokens) < n:
+            continue
+        best = 0.0
+        for i in range(len(q_tokens) - n + 1):
+            window = " ".join(q_tokens[i:i+n])
+            best = max(best, difflib.SequenceMatcher(None, window, pn).ratio())
+        if best >= 0.88:
+            quoted = ",".join(_sql_text(str(v).upper()) for v in values)
+            return f"UPPER({p}{field}) IN ({quoted})", note + f" (interpretado con {best:.0%} de confianza)"
     return "", ""
 
 
@@ -1274,6 +1323,12 @@ def _generic_sales_dimension_condition(q: str, alias: str = "v") -> tuple[str, s
             if len(set(matched)) > 3:
                 detail += ", …"
             return exact_values_condition(field, matched), f"{label}: {detail}"
+
+    # 4) Fallback semántico tolerante a errores de escritura, siempre contra
+    #    valores reales del catálogo.
+    smart_cond, smart_note = _smart_catalog_filter(qn, alias)
+    if smart_cond:
+        return smart_cond, smart_note
 
     return "", ""
 
@@ -1864,11 +1919,12 @@ def _person_tokens_present(raw: str, question: str) -> bool:
 
 
 def _requested_promoters(q: str) -> list[str]:
-    """Reconoce uno o varios nombres reales de promotor mencionados en la frase."""
+    """Reconoce nombres de promotor, incluso invertidos o con un typo menor."""
     qn = _norm(q)
     found: list[str] = []
     seen: set[str] = set()
-    for raw in sorted(_promoter_values(), key=lambda x: (-len(_norm(x)), _norm(x))):
+    known = sorted(_promoter_values(), key=lambda x: (-len(_norm(x)), _norm(x)))
+    for raw in known:
         nv = _norm(raw)
         if len(nv) < 3:
             continue
@@ -1876,6 +1932,31 @@ def _requested_promoters(q: str) -> list[str]:
         flexible = _person_tokens_present(raw, qn)
         key = _norm(raw)
         if (exact or flexible) and key not in seen:
+            found.append(raw)
+            seen.add(key)
+
+    # Fallback fuzzy conservador: compara ventanas con la misma cantidad de tokens
+    # y también el orden alfabético para tolerar `Enzo Villagra` / `VILLAGRA ENZO`.
+    q_tokens = [t for t in re.findall(r"[a-z0-9]+", qn) if len(t) > 1]
+    for raw in known:
+        key = _norm(raw)
+        if key in seen:
+            continue
+        name_tokens = key.split()
+        n = len(name_tokens)
+        if n < 2 or len(q_tokens) < n:
+            continue
+        best = 0.0
+        target_sorted = " ".join(sorted(name_tokens))
+        for i in range(len(q_tokens) - n + 1):
+            window_tokens = q_tokens[i:i+n]
+            window = " ".join(window_tokens)
+            score = max(
+                difflib.SequenceMatcher(None, window, key).ratio(),
+                difflib.SequenceMatcher(None, " ".join(sorted(window_tokens)), target_sorted).ratio(),
+            )
+            best = max(best, score)
+        if best >= 0.88:
             found.append(raw)
             seen.add(key)
     return found
@@ -1942,6 +2023,150 @@ def _sales_field_values(field: str) -> list[str]:
         if raw and key:
             values.setdefault(key, raw)
     return sorted(values.values(), key=lambda x: (-len(_norm(x)), _norm(x)))
+
+
+_SMART_CATALOG_FIELDS = (
+    ("marca", "marca", 0),
+    ("marca_unificada", "marca unificada", 1),
+    ("calibre_unificado", "calibre unificado", 2),
+    ("calibre", "calibre", 3),
+    ("division", "división", 4),
+    ("segmento", "segmento", 5),
+    ("segmento_2", "segmento 2", 6),
+    ("segmento_3", "segmento 3", 7),
+    ("unidad_negocio", "unidad de negocio", 8),
+    ("ung_top", "UNG TOP", 9),
+    ("calibres_cpr", "Calibres CPR", 10),
+    ("producto", "producto", 11),
+)
+
+
+def _fuzzy_ratio(left: str, right: str) -> float:
+    return difflib.SequenceMatcher(None, _norm(left), _norm(right)).ratio()
+
+
+def _phrase_value_score(phrase: str, value: str) -> float:
+    """Score local para resolver errores de escritura sin abrir LIKE peligrosos.
+
+    Compara también ventanas contiguas del valor. Por eso `pure gol` se parece a
+    la subfrase `pure gold` de `STELLA ARTOIS PURE GOLD`, sin confundirse con
+    `PUREZA VITAL`.
+    """
+    pn, vn = _norm(phrase), _norm(value)
+    if not pn or not vn:
+        return 0.0
+    if pn == vn:
+        return 1.0
+    p_tokens, v_tokens = pn.split(), vn.split()
+    if re.search(rf"(?<!\w){re.escape(pn)}(?!\w)", vn):
+        return max(0.93, 0.985 - 0.01 * max(0, len(v_tokens) - len(p_tokens)))
+    if re.search(rf"(?<!\w){re.escape(vn)}(?!\w)", pn):
+        return 0.97
+    # Fuzzy de una sola palabra sólo contra un valor también de una sola palabra.
+    # Evita PURE -> PUREZA VITAL.
+    if len(p_tokens) == 1 and len(v_tokens) != 1:
+        return 0.0
+    best = _fuzzy_ratio(pn, vn)
+    n = len(p_tokens)
+    if n >= 1 and len(v_tokens) >= n:
+        for i in range(len(v_tokens) - n + 1):
+            window = " ".join(v_tokens[i:i+n])
+            best = max(best, _fuzzy_ratio(pn, window))
+    if len(p_tokens) >= 2:
+        best = max(best, _fuzzy_ratio(" ".join(sorted(p_tokens)), " ".join(sorted(v_tokens))))
+    return best
+
+
+def _resolve_field_value(field: str, phrase: str, min_score: float = 0.82) -> tuple[list[str], float]:
+    values = _sales_field_values(field)
+    scored = []
+    for raw in values:
+        score = _phrase_value_score(phrase, raw)
+        if score >= min_score:
+            scored.append((score, raw))
+    if not scored:
+        return [], 0.0
+    scored.sort(key=lambda x: (-x[0], len(_norm(x[1])), _norm(x[1])))
+    top = scored[0][0]
+    # Valores prácticamente empatados se conservan como un conjunto válido.
+    winners = [raw for score, raw in scored if score >= top - 0.015][:8]
+    return list(dict.fromkeys(winners)), top
+
+
+def _smart_catalog_filter(q: str, alias: str = "v", excluded_fields: set[str] | None = None) -> tuple[str, str]:
+    """Resuelve una entidad comercial no etiquetada usando el catálogo real.
+
+    Es el fallback semántico del motor local: tolera errores menores de escritura,
+    prioriza frases de varias palabras y sólo emite SQL con valores existentes.
+    """
+    excluded_fields = excluded_fields or set()
+    qn = _norm(q)
+    p = alias + "." if alias else ""
+
+    person_tokens: set[str] = set()
+    for person in _requested_promoters(qn):
+        person_tokens.update(_norm(person).split())
+    supervisor = _promoter_supervisor(qn)
+    if supervisor:
+        person_tokens.update(_norm(supervisor).split())
+
+    words = re.findall(r"[a-z0-9]+", qn)
+    meaningful = []
+    for idx, word in enumerate(words):
+        if word in _GENERIC_SALES_STOPWORDS or word in person_tokens or word.isdigit():
+            continue
+        if len(word) < 3:
+            continue
+        meaningful.append((idx, word))
+    if not meaningful:
+        return "", ""
+
+    # Construir runs contiguos para no mezclar frases a ambos lados de palabras de control.
+    runs: list[list[str]] = []
+    current: list[str] = []
+    last_idx = None
+    for idx, word in meaningful:
+        if last_idx is not None and idx != last_idx + 1:
+            if current:
+                runs.append(current)
+            current = []
+        current.append(word)
+        last_idx = idx
+    if current:
+        runs.append(current)
+
+    phrases: list[str] = []
+    for run in runs:
+        max_n = min(5, len(run))
+        for n in range(max_n, 0, -1):
+            # Single-token fuzzy is deliberately strict; exact values can still win.
+            for i in range(len(run) - n + 1):
+                phrase = " ".join(run[i:i+n])
+                if phrase not in phrases:
+                    phrases.append(phrase)
+
+    candidates = []
+    for phrase in phrases:
+        n_tokens = len(phrase.split())
+        for field, label, priority in _SMART_CATALOG_FIELDS:
+            if field in excluded_fields:
+                continue
+            # typo tolerance for 2+ words; one word needs very high confidence.
+            threshold = 0.80 if n_tokens >= 2 else 0.96
+            values, score = _resolve_field_value(field, phrase, threshold)
+            if not values:
+                continue
+            # Prefer longer phrases, exact/high score and canonical dimensions over product text.
+            rank = score + min(n_tokens, 4) * 0.025 - priority * 0.001
+            candidates.append((rank, score, n_tokens, priority, field, label, phrase, values))
+
+    if not candidates:
+        return "", ""
+    candidates.sort(key=lambda x: (-x[0], -x[2], x[3]))
+    _, score, _, _, field, label, phrase, values = candidates[0]
+    quoted = ",".join(_sql_text(v.upper()) for v in values)
+    detail = ", ".join(values[:4]) + (", …" if len(values) > 4 else "")
+    return f"UPPER({p}{field}) IN ({quoted})", f"{label}: {detail} (interpretado de ‘{phrase}’, {score:.0%})"
 
 
 def _extract_dimension_tail(qn: str, marker: str) -> str:
@@ -2045,8 +2270,13 @@ def _field_filter_from_text(field: str, label: str, qn: str, marker: str, alias:
         return None
 
     useful = tokens[:5]
-    clauses = [f"UPPER({p}{field}) LIKE '%{t.upper().replace(chr(39), chr(39)*2)}%'" for t in useful]
-    return "(" + " AND ".join(clauses) + ")", f"{label}: " + " ".join(useful)
+    phrase = " ".join(useful)
+    values, score = _resolve_field_value(field, phrase, 0.78 if len(useful) >= 2 else 0.93)
+    if values:
+        quoted = ",".join(_sql_text(v.upper()) for v in values)
+        detail = ", ".join(values[:5])
+        return f"UPPER({p}{field}) IN ({quoted})", f"{label}: {detail} (interpretado de ‘{phrase}’, {score:.0%})"
+    return None
 
 
 def _promoter_dashboard_filter_conditions(q: str, alias: str = "v", allow_generic: bool = True) -> tuple[list[str], list[str]]:
@@ -2132,6 +2362,49 @@ def _promoter_group_dimension(q: str) -> dict[str, str] | None:
     return None
 
 
+def _merge_promoter_followup_query(previous: str, followup: str) -> str:
+    """Fusiona repreguntas como filtros, reemplazando dimensiones incompatibles.
+
+    `y de UNG?` después de `son de cerveza?` debe cambiar el foco a UNG, no
+    construir CZA AND UNG. La frase `solo X` también reemplaza el foco comercial
+    anterior cuando X resuelve a una marca/producto concreto.
+    """
+    prev = _norm(previous)
+    new = _norm(followup)
+    if not prev:
+        return new
+
+    new_cza = bool(re.search(r"\bcza\b|cerveza", new))
+    new_ung = bool(re.search(r"\bung\b", new)) and "ung top" not in new
+    new_agua = bool(re.search(r"\bagua(?:s)?\b|gaseosa", new))
+    new_focus = any(k in new for k in ("above core", "balanced", "premium", "nabs")) or bool(re.search(r"\bcore\b|\bvalue\b", new))
+    exclusive_new = new_cza or new_ung or new_agua or new_focus
+
+    if exclusive_new:
+        # Quitar filtros comerciales de la misma familia antes de añadir el nuevo.
+        patterns = [
+            r"\b(?:son\s+de\s+|es\s+de\s+|y\s+de\s+|de\s+|solo\s+|solamente\s+)?(?:cervezas?|cza|ung|aguas?|gaseosas?)\b",
+            r"\b(?:above\s+core|balanced(?:\s+choices)?|premium|nabs|core|value)\b",
+        ]
+        for pattern in patterns:
+            prev = re.sub(pattern, " ", prev)
+
+    # `solo pure gold`, `solo corona`, etc. debe poder salir de un foco previo
+    # incompatible (por ejemplo UNG) aun cuando el nuevo valor no diga "marca".
+    if new.startswith(("solo ", "solamente ")):
+        alias_cond, _ = _commercial_alias_condition(new, "v")
+        smart_cond, _ = _smart_catalog_filter(new, "v")
+        if alias_cond or smart_cond:
+            for pattern in (
+                r"\b(?:cervezas?|cza|ung|aguas?|gaseosas?)\b",
+                r"\b(?:above\s+core|balanced(?:\s+choices)?|premium|nabs|core|value)\b",
+            ):
+                prev = re.sub(pattern, " ", prev)
+
+    prev = re.sub(r"\s+", " ", prev).strip(" ,.-")
+    return f"{prev} {new}".strip()
+
+
 def _promoter_followup_plan(q: str, context: dict[str, Any] | None = None) -> dict | None:
     """Aplica filtros cortos sobre la última consulta de promotores.
 
@@ -2193,12 +2466,25 @@ def _promoter_followup_plan(q: str, context: dict[str, Any] | None = None) -> di
     if not has_promoter_base:
         return None
 
+    # Una pregunta nueva y autosuficiente sobre promotores NO debe heredar el
+    # contexto anterior sólo por ser corta. Ej.: "venta por promotor calibre 473"
+    # es una consulta nueva, no una repregunta sobre el promotor previo.
+    current_names = _requested_promoters(qn)
+    current_supervisor = _promoter_supervisor(qn)
+    self_contained_promoter = bool(
+        re.search(r"\bpromotor(?:es)?\b|\bsupervisor(?:es)?\b", qn)
+        or current_names
+        or current_supervisor
+    )
+    if self_contained_promoter and not (follow_ref or follow_prefix):
+        return None
+
     # Si hay una consulta de promotores previa, un filtro corto es continuidad aunque
     # el usuario no escriba "esos"/"y". Ej.: simplemente "cerveza" o "CZA".
     if not (follow_ref or follow_prefix or short_filter):
         return None
 
-    combined = f"{previous} {qn}"
+    combined = _merge_promoter_followup_query(previous, qn)
     # Respetar el tipo de consulta original cuando sea posible. Para consultas de
     # clientes/venta, el analizador de promotores es más específico; para KPIs puros,
     # el dashboard conserva CCC/TBD/planificación.
@@ -2213,6 +2499,9 @@ def _promoter_followup_plan(q: str, context: dict[str, Any] | None = None) -> di
             plan = dict(plan)
             base_assumption = str(plan.get("assumption") or "")
             plan["assumption"] = ("Repregunta aplicada sobre la consulta anterior de Promotores KPI. " + base_assumption).strip()
+            # Guardar la consulta semántica completa, no sólo la frase corta
+            # ("y de UNG?"). Así las repreguntas pueden encadenarse indefinidamente.
+            plan["context_question"] = combined
             return plan
     return None
 
@@ -2829,6 +3118,215 @@ def _promoter_analytics_plan(q: str, context: dict[str, Any] | None = None) -> d
     }
 
 
+def _topes_customer_code(q: str, context: dict[str, Any] | None = None) -> tuple[str, str] | None:
+    snap = _safe_snap(topes_repo_source)
+    rows = snap.get("rows") or []
+    if not rows:
+        return None
+    by_code = {}
+    for row in rows:
+        cid = str(row.get("cliente_codigo") or "")
+        if cid:
+            by_code.setdefault(cid, str(row.get("cliente") or ""))
+    explicit = re.search(r"\bcliente(?:\s+(?:nro|numero|num))?\s*[:#-]?\s*(\d{1,7})\b", q)
+    nums = [explicit.group(1)] if explicit else re.findall(r"(?<!\d)(\d{3,7})(?!\d)", q)
+    for raw in nums:
+        clean = raw.lstrip("0") or "0"
+        if clean in by_code:
+            return clean, by_code[clean]
+    ctx = context or {}
+    active = str(ctx.get("active_client_id") or "")
+    if active in by_code and any(k in q for k in ("ese cliente", "este cliente", "el mismo", "y ")):
+        return active, by_code[active]
+    return None
+
+
+def _topes_repo_plan(q: str, context: dict[str, Any] | None = None) -> dict | None:
+    """Consulta la misma lógica del dashboard `Control bultos Core / Value`.
+
+    Soporta topes, avance, faltantes, extensiones, segundo tramo y cruces por
+    promotor/supervisor. Es deliberadamente anterior al analizador genérico de
+    promotores para que `clientes de Gaston pasados del tope Core` no se convierta
+    en una consulta de venta común.
+    """
+    qn = _norm(q)
+    previous_plan = (_LAST_ANALYST_TURN.get("plan") or {}) if isinstance(_LAST_ANALYST_TURN, dict) else {}
+    previous_question = str(_LAST_ANALYST_TURN.get("question") or "") if isinstance(_LAST_ANALYST_TURN, dict) else ""
+    previous_intent = _norm(previous_plan.get("intent") or "")
+    topes_terms = any(k in qn for k in ("tope", "topes", "bulto", "bultos", "extension", "extensión", "segundo tramo"))
+    if not topes_terms and "topes_repo" in previous_intent:
+        # Continuidad de Topes sólo cuando la frase realmente parece una repregunta.
+        # Antes cualquier oración corta heredaba el cliente anterior, por ejemplo
+        # "venta por promotor calibre 473", contaminando una consulta nueva.
+        follow_ref = bool(re.search(r"\b(esos|esas|estos|estas|ellos|ellas|los|las|anterior(?:es)?|mismo(?:s|as)?)\b", qn))
+        follow_prefix = qn.startswith((
+            "y ", "y de ", "de ", "solo ", "solamente ", "ahora ", "pero ",
+            "los de ", "las de ", "filtra ", "filtrame ", "mostrame ", "mostra ",
+        ))
+        topes_filter_hint = bool(re.search(
+            r"\b(core|value|segundo|extension|faltan?|restan?|cerca|pasad(?:o|os|a|as)|pendiente(?:s)?|llegaron?|cumplieron?)\b",
+            qn,
+        ))
+        very_short_filter = len(qn.split()) <= 3 and topes_filter_hint
+        if follow_ref or follow_prefix or very_short_filter:
+            qn = _norm(previous_question + " " + qn)
+            topes_terms = True
+    if not topes_terms:
+        return None
+
+    snap = _safe_snap(topes_repo_source)
+    if not (snap.get("rows") or []):
+        return {
+            "action":"unavailable", "title":"", "sql":"", "assumption":"", "clarifying_question":"",
+            "reason":"La fuente **Topes Core / Value** todavía no tiene snapshot. Se actualizará automáticamente desde ventadiaria bultos y BD_EXTENSION_TOPES.",
+            "intent":"topes_repo",
+        }
+
+    action = "CORE" if re.search(r"\bcore\b", qn) else "VALUE" if re.search(r"\bvalue\b", qn) else ""
+    customer = _topes_customer_code(qn, context)
+    requested = _requested_promoters(qn)
+    supervisor = _promoter_supervisor(qn)
+    route_group = _promoter_route_group(qn)
+    wants_second = any(k in qn for k in ("segundo tope", "2do tope", "segundo tramo", "segunda escala"))
+    wants_extension = "extension" in qn or "extensión" in qn
+    wants_count = any(k in qn for k in ("cuantos", "cuantas", "cantidad"))
+    by_promoter = bool(requested or supervisor or "por promotor" in qn or "promotores" in qn)
+    limit = _extract_limit(qn)
+
+    filters = ["1=1"]
+    notes = []
+    if action:
+        filters.append(f"UPPER(t.segmento)={_sql_text(action)}")
+        notes.append(action)
+    if customer:
+        filters.append(f"t.cliente_codigo={_sql_text(customer[0])}")
+        notes.append(f"cliente {customer[0]} · {customer[1]}")
+    if wants_extension and not wants_second:
+        filters.append("COALESCE(t.extension_activa,0)=1")
+        notes.append("extensión activa")
+
+    remaining_col = "t.restante_segundo_bultos" if wants_second else "t.restante_bultos"
+    advance_col = "CASE WHEN t.segundo_tope_bultos>0 THEN 100.0*t.segundo_tramo_comprado/t.segundo_tope_bultos ELSE NULL END" if wants_second else "t.avance_pct"
+    if wants_second:
+        filters.append("COALESCE(t.extension_activa,0)=1")
+        notes.append("segundo tope")
+
+    if any(k in qn for k in ("llegaron", "llego", "llegó", "cumplieron", "cumplio", "cumplió", "pasados", "superaron", "al tope")) and not any(k in qn for k in ("no llegaron", "sin llegar")):
+        filters.append(f"COALESCE({remaining_col},999999)<=0")
+        notes.append("tope alcanzado o superado")
+    elif any(k in qn for k in ("no llegaron", "sin llegar", "pendientes")):
+        filters.append(f"COALESCE({remaining_col},999999)>0")
+        notes.append("tope pendiente")
+
+    threshold = None
+    m = re.search(r"(?:faltan|falta|restante|restan)[^0-9]{0,18}(?:<=|hasta|menos de|menos)?\s*(\d+(?:[.,]\d+)?)", qn)
+    if not m:
+        m = re.search(r"(?:<=|hasta|menos de)\s*(\d+(?:[.,]\d+)?)\s*bult", qn)
+    if m:
+        threshold = float(m.group(1).replace(",", "."))
+        filters.append(f"COALESCE({remaining_col},999999)<={threshold}")
+        filters.append(f"COALESCE({remaining_col},-999999)>0")
+        notes.append(f"faltan hasta {threshold:g} bultos")
+    elif "cerca" in qn:
+        threshold = 50.0
+        filters.append(f"COALESCE({remaining_col},999999)<=50")
+        filters.append(f"COALESCE({remaining_col},-999999)>0")
+        notes.append("faltan hasta 50 bultos")
+
+    pm_cte = ""
+    pm_join = ""
+    pm_select = ""
+    if by_promoter:
+        pm_conditions = ["TRIM(COALESCE(promotor,''))<>''"]
+        if requested:
+            vals = ",".join(_sql_text(x.upper()) for x in requested)
+            pm_conditions.append(f"UPPER(promotor) IN ({vals})")
+            notes.append("promotor: " + ", ".join(requested))
+        if supervisor:
+            pm_conditions.append(f"UPPER(supervisor)={_sql_text(supervisor)}")
+            notes.append("supervisor: " + supervisor)
+        if route_group:
+            pm_conditions.append(f"UPPER(grupo_ruta)={_sql_text(route_group)}")
+            notes.append("ruta: " + route_group)
+        pm_cte = f"""pm AS (
+            SELECT cliente_codigo, promotor, MAX(supervisor) AS supervisor
+            FROM promotores_ruta
+            WHERE {' AND '.join(pm_conditions)}
+            GROUP BY cliente_codigo, promotor
+        )"""
+        pm_join = "JOIN pm ON pm.cliente_codigo=t.cliente_codigo"
+        pm_select = "pm.promotor, pm.supervisor, "
+
+    where = " AND ".join(filters)
+    period = f"corte {snap.get('period_start','')} a {snap.get('period_end','')}"
+    base_assumption = "Topes calculados con la lógica de dashboard_bultos_accion.py: K+T 200, AS 500, Mayorista 1000; Core/Value en bultos. Extensiones tomadas de BD_EXTENSION_TOPES. " + period + "."
+    if notes:
+        base_assumption += " Filtros: " + ", ".join(notes) + "."
+
+    # Un cliente concreto: mostrar toda la anatomía del tope.
+    if customer:
+        second_cols = """
+               CASE WHEN COALESCE(t.extension_activa,0)=1 THEN 'Sí' ELSE 'No' END AS extension_activa, t.fecha_extension,
+               ROUND(t.segundo_tope_bultos,0) AS segundo_tope_bultos,
+               ROUND(t.segundo_tramo_comprado,2) AS segundo_tramo_comprado,
+               ROUND(t.restante_segundo_bultos,2) AS restante_segundo_bultos"""
+        sql = f"""
+            {('WITH ' + pm_cte) if pm_cte else ''}
+            SELECT {pm_select}t.cliente_codigo, t.cliente, t.segmento, t.canal,
+                   ROUND(t.bultos_comprados,2) AS bultos_comprados,
+                   ROUND(t.tope_bultos,0) AS tope_bultos,
+                   ROUND(t.avance_pct,1) AS avance_pct,
+                   ROUND(t.restante_bultos,2) AS restante_bultos,
+                   t.estado_tope,{second_cols}
+            FROM topes_repo t
+            {pm_join}
+            WHERE {where}
+            ORDER BY t.segmento
+            LIMIT {limit}
+        """
+        return {"action":"query", "title":"Topes Core / Value del cliente", "sql":sql,
+                "assumption":base_assumption, "clarifying_question":"", "reason":"", "intent":"topes_repo_cliente", "display_all":True}
+
+    # Resumen por promotor: un renglón por promotor y segmento, útil para gestión.
+    if by_promoter and (wants_count or "por promotor" in qn or "resumen" in qn or "cada promotor" in qn):
+        sql = f"""
+            WITH {pm_cte}
+            SELECT pm.promotor, pm.supervisor, t.segmento,
+                   COUNT(DISTINCT t.cliente_codigo) AS clientes,
+                   ROUND(SUM(t.bultos_comprados),2) AS bultos_comprados,
+                   ROUND(SUM(t.tope_bultos),0) AS tope_bultos,
+                   COUNT(DISTINCT CASE WHEN t.avance_pct>=100 THEN t.cliente_codigo END) AS clientes_al_tope,
+                   COUNT(DISTINCT CASE WHEN t.restante_bultos>0 AND t.restante_bultos<=50 THEN t.cliente_codigo END) AS clientes_cerca,
+                   COUNT(DISTINCT CASE WHEN COALESCE(t.extension_activa,0)=1 THEN t.cliente_codigo END) AS clientes_con_extension
+            FROM topes_repo t
+            {pm_join}
+            WHERE {where}
+            GROUP BY pm.promotor, pm.supervisor, t.segmento
+            ORDER BY pm.promotor, t.segmento
+            LIMIT {MAX_RESULT_ROWS}
+        """
+        return {"action":"query", "title":"Topes Core / Value por promotor", "sql":sql,
+                "assumption":base_assumption, "clarifying_question":"", "reason":"", "intent":"topes_repo_promotor", "display_all":True}
+
+    # Detalle accionable: clientes cerca, pasados, pendientes o con extensión.
+    sql = f"""
+        {('WITH ' + pm_cte) if pm_cte else ''}
+        SELECT {pm_select}t.cliente_codigo, t.cliente, t.segmento, t.canal,
+               ROUND(t.bultos_comprados,2) AS bultos_comprados,
+               ROUND(t.tope_bultos,0) AS tope_bultos,
+               ROUND({advance_col},1) AS avance_pct,
+               ROUND({remaining_col},2) AS restante_bultos,
+               CASE WHEN COALESCE(t.extension_activa,0)=1 THEN 'Sí' ELSE 'No' END AS extension_activa, t.fecha_extension
+        FROM topes_repo t
+        {pm_join}
+        WHERE {where}
+        ORDER BY {remaining_col} ASC, t.bultos_comprados DESC
+        LIMIT {MAX_RESULT_ROWS if 'todos' in qn else limit}
+    """
+    return {"action":"query", "title":"Control de topes Core / Value", "sql":sql,
+            "assumption":base_assumption, "clarifying_question":"", "reason":"", "intent":"topes_repo", "display_all":"todos" in qn}
+
+
 def _current_sales_plan(q: str, context: dict[str, Any] | None = None) -> dict | None:
     if not _is_current_sales_question(q):
         return None
@@ -2841,6 +3339,8 @@ def _current_sales_plan(q: str, context: dict[str, Any] | None = None) -> dict |
     filters, notes = _sales_filters(q, context, "v")
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
     metric_expr, metric_alias, metric_label = _metric(q, "v")
+    wants_hl_explicit, wants_money_explicit, wants_invoices_explicit = _requested_sales_metrics(q)
+    has_explicit_metrics = wants_hl_explicit or wants_money_explicit or wants_invoices_explicit
     entity = _group_entity(q)
     requested_units = _requested_business_units(q, "v")
     limit = _extract_limit(q)
@@ -3113,22 +3613,26 @@ def _current_sales_plan(q: str, context: dict[str, Any] | None = None) -> dict |
         select="COALESCE(NULLIF(v.localidad_base,''),'SIN BASE') AS localidad_base"
         group="COALESCE(NULLIF(v.localidad_base,''),'SIN BASE')"
     else:
-        # Total del mes/filtro pedido. Si el usuario pide una métrica concreta ($/facturas),
-        # respondemos esa métrica en vez de mezclarla con información no solicitada.
-        if metric_alias == "importe_neto":
+        # Total del mes/filtro pedido. Las métricas explícitas son acumulables: una
+        # pregunta como "en pesos y HL" devuelve ambas en la misma respuesta.
+        if has_explicit_metrics:
+            cols = []
+            labels = []
+            if wants_hl_explicit:
+                cols.append("ROUND(SUM(v.hl),2) AS hl")
+                labels.append("HL")
+            if wants_money_explicit:
+                cols.append("ROUND(SUM(v.importe_neto),2) AS importe_neto")
+                labels.append("$")
+            if wants_invoices_explicit:
+                cols.append("ROUND(SUM(v.facturas),0) AS facturas")
+                labels.append("facturas")
             sql=f"""
-                SELECT ROUND(SUM(v.importe_neto),2) AS importe_neto
+                SELECT {', '.join(cols)}
                 FROM ventas_mes_actual v
                 {where}
             """
-            title="Venta en $ del mes"
-        elif metric_alias == "facturas":
-            sql=f"""
-                SELECT ROUND(SUM(v.facturas),0) AS facturas
-                FROM ventas_mes_actual v
-                {where}
-            """
-            title="Facturas del mes"
+            title="Venta acumulada del mes · " + " + ".join(labels)
         else:
             sql=f"""
                 SELECT ROUND(SUM(v.hl),2) AS hl,
@@ -3151,8 +3655,20 @@ def _current_sales_plan(q: str, context: dict[str, Any] | None = None) -> dict |
     if m2 and metric_alias == "hl":
         having=f"HAVING SUM(v.hl) > {float(m2.group(1).replace(',', '.'))}"
 
+    if has_explicit_metrics:
+        metric_cols = []
+        if wants_hl_explicit:
+            metric_cols.append("ROUND(SUM(v.hl),2) AS hl")
+        if wants_money_explicit:
+            metric_cols.append("ROUND(SUM(v.importe_neto),2) AS importe_neto")
+        if wants_invoices_explicit:
+            metric_cols.append("ROUND(SUM(v.facturas),0) AS facturas")
+        metric_select = ", ".join(metric_cols)
+    else:
+        metric_select = f"ROUND({metric_expr},2) AS {metric_alias}"
+
     sql=f"""
-        SELECT {select}, ROUND({metric_expr},2) AS {metric_alias}
+        SELECT {select}, {metric_select}
         FROM ventas_mes_actual v
         {where}
         GROUP BY {group}
@@ -3243,7 +3759,7 @@ def _customer_cross_plan(q: str) -> dict | None:
                 ORDER BY descuento_pct DESC, tope_bultos DESC
                 LIMIT {limit}
             """,
-            "assumption": "Cruzo descuentos de Grupo de clientes con topes de Planificación por código de cliente.",
+            "assumption": "Cruzo descuentos de Grupo de clientes con los topes Core/Value del repo planificacion por código de cliente.",
             "clarifying_question": "",
             "reason": "",
         }
@@ -3263,7 +3779,7 @@ def _customer_cross_plan(q: str) -> dict | None:
                        FROM topes_cliente {where}
                        ORDER BY {order}
                        LIMIT {limit}""",
-            "assumption": "Uso el tope por cliente calculado desde Planificación.",
+            "assumption": "Uso el tope por cliente calculado con la lógica del tablero Core/Value del repo planificacion.",
             "clarifying_question": "",
             "reason": "",
         }
@@ -3347,6 +3863,13 @@ def _local_plan(question: str, context: dict[str, Any] | None = None) -> dict:
     if plan:
         return plan
 
+    # Topes Core/Value usa como fuente canónica el dashboard del repo. Debe
+    # ejecutarse antes que Promotores para no interpretar "tope de Gaston" como
+    # una consulta genérica de venta por promotor.
+    plan = _topes_repo_plan(q, context)
+    if plan:
+        return plan
+
     # Repreguntas sobre el resultado anterior de Promotores: "¿esos son de cerveza?",
     # "¿y de UNG?", "¿sólo marca Corona?", etc.
     plan = _promoter_followup_plan(q, context)
@@ -3424,7 +3947,7 @@ FORBIDDEN_SQL = re.compile(
 ALLOWED_TABLES = {
     "frescura_productos", "frescura_lotes", "frescura_perfiles",
     "clientes", "repago_edf", "ventas_mensuales_cliente",
-    "descuentos_cliente", "topes_cliente",
+    "descuentos_cliente", "topes_cliente", "topes_repo", "topes_repo_meta",
     "ventas_mes_actual", "ventas_mes_actual_meta", "maestro_clientes_actual",
     "promotores_ruta", "promotores_plan",
 }
@@ -3484,6 +4007,19 @@ FRIENDLY = {
     "repago_trimestre_pct": "Repago trimestre %",
     "repago_ultimo_mes_pct": "Repago último mes %",
     "tope_bultos": "Tope bultos",
+    "bultos_comprados": "Bultos comprados",
+    "avance_pct": "Avance %",
+    "restante_bultos": "Faltan bultos",
+    "estado_tope": "Estado tope",
+    "primer_tope_comprado": "Primer tope comprado",
+    "extension_activa": "Extensión activa",
+    "fecha_extension": "Fecha extensión",
+    "segundo_tope_bultos": "Segundo tope",
+    "segundo_tramo_comprado": "Segundo tramo comprado",
+    "restante_segundo_bultos": "Faltan segundo tope",
+    "clientes_al_tope": "Clientes al tope",
+    "clientes_cerca": "Clientes cerca",
+    "clientes_con_extension": "Clientes con extensión",
     "descuento_pct": "Descuento %",
     "cantidad": "Cantidad",
     "total": "Total",
@@ -3615,8 +4151,8 @@ def _source_labels(tables: list[str]) -> list[str]:
         out.append("EDF/Repago · snapshot local")
     if "descuentos_cliente" in tables:
         out.append("Grupo de clientes · snapshot local")
-    if "topes_cliente" in tables:
-        out.append("Planificación · topes local")
+    if any(t in {"topes_cliente", "topes_repo", "topes_repo_meta"} for t in tables):
+        out.append("Topes Core / Value · repo planificacion · snapshot local")
     if any(t.startswith("ventas_mes_actual") or t == "maestro_clientes_actual" for t in tables):
         out.append("CHESS · venta mes actual · snapshot local")
     if any(t in {"promotores_ruta", "promotores_plan"} for t in tables):
@@ -3648,16 +4184,17 @@ def analyze_question(question: str, context: dict[str, Any] | None = None) -> An
     # repreguntas como "son de CZA" después de una consulta por promotor.
     global _LAST_ANALYST_TURN
     if action == "query":
-        _LAST_ANALYST_TURN = {"question": str(question or ""), "plan": dict(plan or {})}
+        context_question = str(plan.get("context_question") or question or "").strip()
+        _LAST_ANALYST_TURN = {"question": context_question, "plan": dict(plan or {})}
         if isinstance(context, dict):
-            context["_analyst_previous_question"] = str(question or "")
+            context["_analyst_previous_question"] = context_question
             if plan.get("intent"):
                 context["active_topic"] = str(plan.get("intent"))
 
         if "promotor" in intent:
-            _save_last_promoter_turn(str(question or ""), plan)
+            _save_last_promoter_turn(context_question, plan)
             if isinstance(context, dict):
-                context["_analyst_last_promoter_question"] = str(question or "")
+                context["_analyst_last_promoter_question"] = context_question
                 context["_analyst_last_promoter_plan"] = dict(plan or {})
 
     if action == "clarify":
