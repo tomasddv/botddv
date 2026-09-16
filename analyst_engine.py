@@ -16,7 +16,7 @@ import pandas as pd
 
 from sources import frescura_source, grupos_source, repago_source, ventas_actual_source, promotores_kpi_source, topes_repo_source
 
-ENGINE_VERSION = "14.0"
+ENGINE_VERSION = "14.1"
 
 MAX_RESULT_ROWS = 500
 DISPLAY_ROWS = 15
@@ -103,6 +103,52 @@ def _safe_snap(module) -> dict:
         return snap or {}
     except Exception:
         return {}
+
+
+# Compatibilidad con el enrutador rápido de assistant_engine.py.
+# Ese enrutador histórico llama a grupos_source.topes() antes de llegar al
+# Analista. Desde v14.1 hacemos que esa llamada lea el snapshot canónico del
+# repo de Topes; así consultas simples como "tope del 969" no quedan atrapadas
+# en la fuente antigua.
+_LEGACY_GRUPOS_TOPES = getattr(grupos_source, "topes", None)
+
+
+def _repo_topes_for_fast_handler(cliente_codigo, segmento=None):
+    code = str(cliente_codigo or "").strip().lstrip("0") or "0"
+    segment = str(segmento or "").strip().upper()
+    snap = _safe_snap(topes_repo_source)
+    matches = []
+    for row in snap.get("rows") or []:
+        cid = str(row.get("cliente_codigo") or "").strip().lstrip("0") or "0"
+        seg = str(row.get("segmento") or "").strip().upper()
+        if cid != code or (segment and seg != segment):
+            continue
+        matches.append({
+            "segmento": seg,
+            "canal": row.get("canal") or "",
+            "tope_bultos": row.get("tope_bultos"),
+            "bultos_comprados": row.get("bultos_comprados"),
+            "avance_pct": row.get("avance_pct"),
+            "restante_bultos": row.get("restante_bultos"),
+            "estado_tope": row.get("estado_tope"),
+            "extension_activa": row.get("extension_activa"),
+            "fecha_extension": row.get("fecha_extension"),
+            "segundo_tope_bultos": row.get("segundo_tope_bultos"),
+            "segundo_tramo_comprado": row.get("segundo_tramo_comprado"),
+            "restante_segundo_bultos": row.get("restante_segundo_bultos"),
+        })
+    if matches:
+        matches.sort(key=lambda r: (r.get("segmento") or ""))
+        return matches
+    if callable(_LEGACY_GRUPOS_TOPES) and _LEGACY_GRUPOS_TOPES is not _repo_topes_for_fast_handler:
+        try:
+            return _LEGACY_GRUPOS_TOPES(cliente_codigo, segmento)
+        except Exception:
+            return []
+    return []
+
+
+grupos_source.topes = _repo_topes_for_fast_handler
 
 
 def _frescura_frames() -> dict[str, pd.DataFrame]:
