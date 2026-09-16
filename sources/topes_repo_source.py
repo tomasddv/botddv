@@ -264,6 +264,76 @@ def _customer_channels(path: Path | None) -> dict[str, str]:
     return out
 
 
+
+def _customer_universe(path: Path | None) -> dict[str, dict]:
+    """Clientes que tienen un tope por canal, aunque todavía no hayan comprado.
+
+    El dashboard calcula el tope a partir del canal comercial. Para el asistente
+    necesitamos conservar también los clientes con venta 0 del mes; de otro modo
+    una pregunta como "tope del 969" fallaba si ese cliente todavía no tenía una
+    fila Core/Value en ventadiaria bultos.
+    """
+    if path is None or not path.exists():
+        return {}
+    try:
+        df = pd.read_excel(path, dtype=str)
+    except Exception:
+        return {}
+    if df.empty:
+        return {}
+
+    customer_col = _find_col(df, "Cliente", "Cod Cliente", "Codigo Cliente")
+    if customer_col is None:
+        return {}
+
+    # En Reporte de clientes el nombre más útil para el bot es el nombre de
+    # fantasía; si falta, usamos razón social.
+    fantasy_col = _find_col(df, "Nombre de fantasia", "Fantasia")
+    legal_col = _find_col(df, "Razon social", "Razón social")
+    route_code_col = _find_col(df, "Fuerza de venta 1 Ruta de venta")
+    route_name_col = _find_col(df, "Fuerza de venta 1 Descripcion ruta de venta")
+    seller_col = _find_col(df, "Fuerza de venta 1 Descripcion personal comercial")
+
+    text_cols = []
+    for col in df.columns:
+        nc = _norm(col)
+        if any(term in nc for term in (
+            "descripcion lista", "lista de precios", "descripcion subcanal", "subcanal",
+            "descripcion ramo", "ramo",
+        )):
+            text_cols.append(col)
+    if not text_cols:
+        return {}
+
+    out: dict[str, dict] = {}
+    for _, row in df.iterrows():
+        cid = _code(row.get(customer_col))
+        if not cid:
+            continue
+        channel_text = " ".join(_clean(row.get(c)) for c in text_cols)
+        channel = _classify_customer_channel(channel_text)
+        channel_action = CANAL_ACCION_ALIAS.get(channel, channel)
+        top = TOPES_CANAL.get(channel)
+        if top is None:
+            top = TOPES_CANAL.get(channel_action)
+        if top is None:
+            continue
+
+        name = _clean(row.get(fantasy_col)) if fantasy_col else ""
+        if not name and legal_col:
+            name = _clean(row.get(legal_col))
+        route_code = _code(row.get(route_code_col)) if route_code_col else ""
+        route_name = _clean(row.get(route_name_col)) if route_name_col else ""
+        out[cid] = {
+            "cliente_codigo": cid,
+            "cliente": name,
+            "canal": channel_action,
+            "ruta": (route_code + (" - " + route_name if route_name else "")).strip(" -"),
+            "vendedor": _clean(row.get(seller_col)) if seller_col else "",
+            "tope_bultos": float(top),
+        }
+    return out
+
 def _brand_segments(path: Path | None) -> dict[str, str]:
     if path is None or not path.exists():
         return {}
@@ -410,7 +480,7 @@ def _build_snapshot(
     max_date = pd.to_datetime(data["fecha"], errors="coerce").max()
     data = data[(data["fecha"].dt.year == max_date.year) & (data["fecha"].dt.month == max_date.month)].copy()
 
-    grouped = (
+    sales_grouped = (
         data.groupby(["cliente_codigo", "segmento"], as_index=False)
         .agg(
             cliente=("cliente", "max"), canal=("canal", "first"), ruta=("ruta", "max"),
@@ -418,6 +488,39 @@ def _build_snapshot(
             tope_bultos=("tope_bultos", "first"),
         )
     )
+
+    # El tope existe por canal aunque el cliente todavía no haya comprado en el
+    # mes. Armamos el universo completo de clientes elegibles y luego sumamos la
+    # venta Core/Value disponible. Esto hace que una venta 0 siga teniendo tope.
+    universe = _customer_universe(customer_path)
+    base_rows = []
+    for cid, info in universe.items():
+        for segment in ("CORE", "VALUE"):
+            base_rows.append({
+                "cliente_codigo": cid,
+                "segmento": segment,
+                "cliente_base": info.get("cliente", ""),
+                "canal_base": info.get("canal", ""),
+                "ruta_base": info.get("ruta", ""),
+                "vendedor_base": info.get("vendedor", ""),
+                "tope_base": float(info.get("tope_bultos") or 0.0),
+            })
+
+    if base_rows:
+        base = pd.DataFrame(base_rows)
+        grouped = base.merge(sales_grouped, on=["cliente_codigo", "segmento"], how="left")
+        grouped["cliente"] = grouped["cliente_base"].fillna("").where(grouped["cliente_base"].fillna("").ne(""), grouped["cliente"].fillna(""))
+        grouped["canal"] = grouped["canal"].fillna("").where(grouped["canal"].fillna("").ne(""), grouped["canal_base"])
+        grouped["ruta"] = grouped["ruta"].fillna("").where(grouped["ruta"].fillna("").ne(""), grouped["ruta_base"])
+        grouped["vendedor"] = grouped["vendedor"].fillna("").where(grouped["vendedor"].fillna("").ne(""), grouped["vendedor_base"])
+        grouped["bultos_comprados"] = pd.to_numeric(grouped["bultos_comprados"], errors="coerce").fillna(0.0)
+        grouped["tope_bultos"] = pd.to_numeric(grouped["tope_bultos"], errors="coerce").fillna(grouped["tope_base"])
+        grouped = grouped[[
+            "cliente_codigo", "segmento", "cliente", "canal", "ruta", "vendedor",
+            "bultos_comprados", "tope_bultos",
+        ]]
+    else:
+        grouped = sales_grouped.copy()
 
     ext = _load_extensions(planner_path_or_url)
     if ext.empty:
@@ -493,7 +596,7 @@ def _build_snapshot(
         })
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source": "planificacion/dashboard_bultos_accion.py · ventadiaria bultos · BD_EXTENSION_TOPES",
         "drive_file_id": drive_file_id,
@@ -542,7 +645,7 @@ def status():
         return {
             "ok": True,
             "name": "Topes Core / Value",
-            "detail": f"{snap.get('clients_count', 0)} clientes · corte {snap.get('period_end', '—')} · extensiones incluidas",
+            "detail": f"{snap.get('clients_count', 0)} clientes con tope · corte {snap.get('period_end', '—')} · incluye venta 0 + extensiones",
             "loaded_at": snap.get("updated_at", "—"),
         }
     if _last_error:
